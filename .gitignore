@@ -32,4 +32,19 @@ Thumbs.db
 
 # Logs
 *.log
-test_output.txt
+test_output.txt*.bak 
+*.bak2 
+*.bak3 
+*.bak4 
+*.bak5 
+*.bak_dtype 
+patch_goai*.py 
+fix_*.py 
+debug.txt 
+worker_log.txt 
+test1_kolkata.txt 
+project_structure.txt 
+python_files.txt 
+worldpop_*.tif 
+data/ 
+app/cache/ 
