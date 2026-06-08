@@ -1,0 +1,17 @@
+{
+    "rules": [
+        "Always convert all layers to the same CRS before any spatial operation. Never assume they are already in the same CRS.",
+        "When joining tables, ensure the common column data types match — convert both to string if unsure.",
+        "GeoPandas does not support on-the-fly reprojection. Always call .to_crs() explicitly before any spatial operation.",
+        "After spatial joins, always check for and remove duplicate features using drop_duplicates().",
+        "Use make_valid() from shapely.validation to fix invalid geometries before any spatial operation. Do not use geometry.buffer(0) as it can alter geometry shape.",
+        "Area calculations in UTM CRS are in square metres — divide by 1,000,000 to get square kilometres.",
+        "Never apply the same buffer distance to all water feature types. Rivers, lakes, and drains have different flood extents and need different buffer sizes.",
+        "When using gpd.sjoin(), always use the predicate= parameter, never the deprecated op= parameter.",
+        "OSMnx features_from_place() returns a MultiIndex DataFrame — always call .reset_index() immediately after.",
+        "Never use data.index + 1 to create rank columns — always use range(1, len(data) + 1).",
+        "After gpd.sjoin(), always drop the geometry column before any groupby aggregation: joined = joined.drop(columns='geometry'). Failing to do this causes a TypeError on groupby sum.",
+        "Never use a 'length' column from road network edges — it may not exist. Always compute edge length from geometry after projecting to a metric CRS: edges['length_m'] = edges.geometry.length",
+        "After any analysis, if the result GeoDataFrame has fewer than 3 features, treat it as a Type 2 error — the spatial join or OSMnx query likely failed silently and returned the wrong data."
+    ]
+}

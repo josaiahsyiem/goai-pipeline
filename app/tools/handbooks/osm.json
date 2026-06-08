@@ -1,0 +1,26 @@
+{
+    "name": "openstreetmap",
+    "description": "Live OpenStreetMap data for any city in the world via OSMnx or Overpass API.",
+    "data_type": "live_api",
+    "crs": "EPSG:4326",
+    "notes": "Always include country in place name (e.g. 'Mumbai, India'). Call .reset_index() after ox.features_from_place(). For POIs and polylines use Overpass API — faster than OSMnx. For boundaries use OSMnx geocode_to_gdf.",
+    "available_features": {
+        "admin_boundaries": "City/ward/district boundaries — ox.geocode_to_gdf() or Overpass boundary=administrative",
+        "hospitals": "Hospitals, clinics — Overpass amenity=hospital|clinic|doctors (FASTER than OSMnx)",
+        "schools": "Schools, universities — Overpass amenity=school|university|college",
+        "parks_greenspace": "Parks, forests — Overpass leisure=park or landuse=forest",
+        "roads": "Road network — ox.graph_from_place() network_type=drive",
+        "water_bodies": "Lakes, rivers — Overpass natural=water or waterway=river",
+        "transit": "Bus stops, metro — Overpass public_transport=stop_position or highway=bus_stop",
+        "commercial": "Shops, restaurants — Overpass shop=* or amenity=restaurant"
+    },
+    "auth": {},
+    "code_templates": {
+        "boundaries": "import osmnx as ox\nimport geopandas as gpd\nfrom shapely.validation import make_valid\nimport warnings; warnings.filterwarnings('ignore')\n\ndef download_data():\n    global result\n    city_gdf = ox.geocode_to_gdf('{place}')\n    city_gdf['geometry'] = city_gdf['geometry'].apply(make_valid)\n    result = city_gdf.to_crs('EPSG:4326')\n\ndownload_data()",
+        "hospitals_overpass": "import requests\nimport geopandas as gpd\nimport pandas as pd\nfrom shapely.geometry import Point\nimport warnings; warnings.filterwarnings('ignore')\n\ndef download_data():\n    global result\n    # Overpass API — faster than OSMnx for POIs\n    overpass_url = 'https://overpass-api.de/api/interpreter'\n    overpass_query = '''\n    [out:json][timeout:60];\n    area[\"name\"=\"{city_name}\"]->.searchArea;\n    (\n      nwr[amenity~\"hospital|clinic|doctors\"](area.searchArea);\n    );\n    out center;\n    '''\n    response = requests.get(overpass_url, params={'data': overpass_query}, timeout=60)\n    data = response.json()\n    rows = []\n    for el in data.get('elements', []):\n        lat = el.get('lat') or el.get('center', {}).get('lat')\n        lon = el.get('lon') or el.get('center', {}).get('lon')\n        if lat and lon:\n            rows.append({'amenity': el.get('tags', {}).get('amenity', 'hospital'), 'name': el.get('tags', {}).get('name', ''), 'geometry': Point(lon, lat)})\n    result = gpd.GeoDataFrame(rows, crs='EPSG:4326') if rows else gpd.GeoDataFrame(columns=['amenity','name','geometry'], geometry='geometry', crs='EPSG:4326')\n\ndownload_data()",
+        "schools_overpass": "import requests\nimport geopandas as gpd\nfrom shapely.geometry import Point\nimport warnings; warnings.filterwarnings('ignore')\n\ndef download_data():\n    global result\n    overpass_url = 'https://overpass-api.de/api/interpreter'\n    overpass_query = '''\n    [out:json][timeout:60];\n    area[\"name\"=\"{city_name}\"]->.searchArea;\n    (\n      nwr[amenity~\"school|university|college|kindergarten\"](area.searchArea);\n    );\n    out center;\n    '''\n    response = requests.get(overpass_url, params={'data': overpass_query}, timeout=60)\n    data = response.json()\n    rows = []\n    for el in data.get('elements', []):\n        lat = el.get('lat') or el.get('center', {}).get('lat')\n        lon = el.get('lon') or el.get('center', {}).get('lon')\n        if lat and lon:\n            rows.append({'amenity': el.get('tags', {}).get('amenity', 'school'), 'name': el.get('tags', {}).get('name', ''), 'geometry': Point(lon, lat)})\n    result = gpd.GeoDataFrame(rows, crs='EPSG:4326') if rows else gpd.GeoDataFrame(columns=['amenity','name','geometry'], geometry='geometry', crs='EPSG:4326')\n\ndownload_data()",
+        "greenspace": "import osmnx as ox\nimport geopandas as gpd\nfrom shapely.validation import make_valid\nimport warnings; warnings.filterwarnings('ignore')\n\ndef download_data():\n    global result\n    tags = {'leisure': 'park', 'landuse': ['forest', 'grass', 'recreation_ground', 'meadow']}\n    gdf = ox.features_from_place('{place}', tags)\n    gdf = gdf.reset_index()\n    gdf = gdf[gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])].copy()\n    gdf['geometry'] = gdf['geometry'].apply(make_valid)\n    result = gdf.to_crs('EPSG:4326')\n\ndownload_data()",
+        "roads": "import osmnx as ox\nimport geopandas as gpd\nimport warnings; warnings.filterwarnings('ignore')\n\ndef download_data():\n    global result\n    G = ox.graph_from_place('{place}', network_type='drive')\n    edges = ox.graph_to_gdfs(G, nodes=False)\n    result = edges.reset_index().to_crs('EPSG:4326')\n\ndownload_data()"
+    },
+    "example_code": "import osmnx as ox\nimport geopandas as gpd\nfrom shapely.validation import make_valid\n\ndef download_data():\n    global result\n    result = ox.geocode_to_gdf('Hyderabad, India')\n    result['geometry'] = result['geometry'].apply(make_valid)\n\ndownload_data()"
+}

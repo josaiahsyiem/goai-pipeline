@@ -1,0 +1,14 @@
+{
+    "name": "mumbai_wards",
+    "description": "Mumbai ward boundaries — 24 administrative wards as polygons stored as a local GeoJSON file.",
+    "file_path": "/data/mumbai_ward_shapefile/Mumbai_wards.geojson",
+    "file_format": "geojson",
+    "crs": "EPSG:4326",
+    "geometry_type": "Polygon",
+    "key_columns": [
+        "ward_full",
+        "population"
+    ],
+    "notes": "Load directly with gpd.read_file(). The population column contains census estimates per ward. For metric spatial operations, project to EPSG:32643 (UTM zone 43N). Use make_valid() on geometry before any spatial operation.",
+    "example_code": "import geopandas as gpd\nfrom shapely.validation import make_valid\n\ndef download_data():\n    global result\n    result = gpd.read_file('/data/mumbai_ward_shapefile/Mumbai_wards.geojson')\n    result['geometry'] = result['geometry'].apply(make_valid)\n\ndownload_data()"
+}

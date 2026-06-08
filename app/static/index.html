@@ -1,0 +1,1067 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GoAI — Geographic AI Pipeline</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: system-ui, sans-serif;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background: #f5f5f5;
+        }
+
+        .header {
+            background: #1a1a2e;
+            color: white;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .header h1 {
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            white-space: nowrap;
+        }
+
+        .header h1 span {
+            color: #6c63ff;
+        }
+
+        .query-bar {
+            display: flex;
+            gap: 8px;
+            flex: 1;
+            min-width: 300px;
+            align-items: center;
+        }
+
+        .query-bar input[type="text"]#taskInput {
+            flex: 1;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: none;
+            font-size: 13px;
+            outline: none;
+        }
+
+        .query-bar button {
+            padding: 8px 18px;
+            background: #6c63ff;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+
+        .query-bar button:hover {
+            background: #5a52d5;
+        }
+
+        .query-bar button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+
+        .city-wrap {
+            position: relative;
+            width: 200px;
+            flex-shrink: 0;
+        }
+
+        .city-wrap input {
+            width: 100%;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: none;
+            font-size: 13px;
+            outline: none;
+        }
+
+        .city-suggestions {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+            z-index: 9999;
+            max-height: 220px;
+            overflow-y: auto;
+            margin-top: 4px;
+        }
+
+        .city-sug-item {
+            padding: 8px 12px;
+            font-size: 12px;
+            color: #333;
+            cursor: pointer;
+            border-bottom: 0.5px solid #f0f0f0;
+            line-height: 1.4;
+        }
+
+        .city-sug-item:hover,
+        .city-sug-item.active {
+            background: #f0f0ff;
+        }
+
+        .city-sug-item:last-child {
+            border-bottom: none;
+        }
+
+        .upload-bar {
+            background: #12122a;
+            padding: 8px 20px;
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            flex-wrap: wrap;
+            border-top: 1px solid #2a2a4a;
+            font-size: 12px;
+        }
+
+        .upload-label {
+            color: #9b9bc0;
+            white-space: nowrap;
+            padding-top: 8px;
+        }
+
+        .upload-files-area {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            flex: 1;
+            min-width: 200px;
+        }
+
+        .upload-file-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #1e1e3a;
+            border: 1px dashed #4a4a7a;
+            border-radius: 8px;
+            padding: 6px 12px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .upload-file-row:hover {
+            border-color: #6c63ff;
+        }
+
+        .upload-file-row.has-file {
+            border-color: #4caf50;
+            background: #1a2e1a;
+            border-style: solid;
+        }
+
+        .upload-file-row input {
+            display: none;
+        }
+
+        .upload-file-label {
+            flex: 1;
+            color: #9b9bc0;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .upload-file-row.has-file .upload-file-label {
+            color: #81c784;
+        }
+
+        .upload-file-info {
+            font-size: 10px;
+            color: #6c63ff;
+        }
+
+        .upload-file-remove {
+            color: #555;
+            cursor: pointer;
+            font-size: 13px;
+            padding: 1px 5px;
+            border-radius: 4px;
+            display: none;
+        }
+
+        .upload-file-remove:hover {
+            color: #f44336;
+        }
+
+        .upload-file-row.has-file .upload-file-remove {
+            display: inline;
+        }
+
+        .upload-add-btn {
+            background: none;
+            border: 1px dashed #4a4a7a;
+            color: #9b9bc0;
+            border-radius: 8px;
+            padding: 4px 12px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+            align-self: flex-start;
+        }
+
+        .upload-add-btn:hover {
+            border-color: #6c63ff;
+            color: #6c63ff;
+        }
+
+        .main {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        #map {
+            flex: 1;
+            height: 100%;
+            position: relative;
+        }
+
+        .sidebar {
+            width: 320px;
+            background: white;
+            border-left: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .status-bar {
+            padding: 12px 16px;
+            background: #f8f8f8;
+            border-bottom: 1px solid #eee;
+            font-size: 12px;
+        }
+
+        .status-idle {
+            color: #888;
+        }
+
+        .status-running {
+            color: #e65100;
+            font-weight: 600;
+        }
+
+        .status-complete {
+            color: #1b5e20;
+            font-weight: 600;
+        }
+
+        .status-failed {
+            color: #b71c1c;
+            font-weight: 600;
+        }
+
+        .progress-steps {
+            display: flex;
+            gap: 4px;
+            margin-top: 8px;
+            flex-wrap: wrap;
+        }
+
+        .step-pill {
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 20px;
+            background: #eee;
+            color: #888;
+            transition: background 0.3s, color 0.3s;
+        }
+
+        .step-pill.active {
+            background: #fff3e0;
+            color: #e65100;
+            animation: pulse 1.2s infinite;
+        }
+
+        .step-pill.done {
+            background: #e8f5e9;
+            color: #1b5e20;
+        }
+
+        .step-pill.failed {
+            background: #ffebee;
+            color: #b71c1c;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.55; }
+        }
+
+        .scores {
+            display: flex;
+            gap: 8px;
+            padding: 10px 16px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .score-box {
+            flex: 1;
+            text-align: center;
+            padding: 8px;
+            background: #f8f8f8;
+            border-radius: 8px;
+        }
+
+        .score-box .val {
+            font-size: 20px;
+            font-weight: 700;
+            color: #1a1a2e;
+        }
+
+        .score-box .lbl {
+            font-size: 10px;
+            color: #888;
+            margin-top: 2px;
+        }
+
+        .methodology-box {
+            display: none;
+            padding: 10px 16px;
+            background: #f0f4ff;
+            border-bottom: 1px solid #e0e0e0;
+            font-size: 11px;
+            color: #444;
+            line-height: 1.6;
+        }
+
+        .methodology-box b {
+            color: #1a1a2e;
+            font-size: 11px;
+        }
+
+        .results-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .result-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            margin-bottom: 4px;
+            cursor: pointer;
+            transition: background 0.15s;
+            border: 1px solid transparent;
+        }
+
+        .result-item:hover {
+            background: #f5f5f5;
+        }
+
+        .result-item.active {
+            background: #f0f0ff;
+            border-color: #6c63ff;
+        }
+
+        .rank-badge {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 700;
+            color: white;
+            flex-shrink: 0;
+        }
+
+        .result-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .result-name {
+            font-size: 13px;
+            font-weight: 500;
+            color: #1a1a1a;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .result-val {
+            font-size: 11px;
+            color: #666;
+            margin-top: 2px;
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #aaa;
+            font-size: 13px;
+            text-align: center;
+            padding: 20px;
+            gap: 8px;
+        }
+
+        .legend {
+            position: absolute;
+            bottom: 30px;
+            left: 10px;
+            z-index: 1000;
+            background: white;
+            padding: 8px 12px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+            font-size: 11px;
+            display: none;
+        }
+
+        .legend-bar {
+            width: 120px;
+            height: 10px;
+            border-radius: 4px;
+            background: linear-gradient(to right, #d32f2f, #f9a825, #2e7d32);
+            margin: 4px 0;
+        }
+
+        .legend-labels {
+            display: flex;
+            justify-content: space-between;
+            color: #666;
+        }
+
+        .paper-badge {
+            font-size: 10px;
+            background: #f0f4ff;
+            color: #1a2f6e;
+            padding: 6px 12px;
+            border-top: 1px solid #e0e0e0;
+            text-align: center;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <h1>Go<span>AI</span> &mdash; Geographic AI Pipeline</h1>
+        <div class="query-bar">
+            <input type="text" id="taskInput" placeholder="Ask any geographic question..." />
+            <div class="city-wrap">
+                <input type="text" id="cityInput" placeholder="City, district, or country..." autocomplete="off"
+                    oninput="fetchCitySuggestions(this.value)" onkeydown="handleCityKey(event)" />
+                <div class="city-suggestions" id="citySuggestions"></div>
+            </div>
+            <button id="submitBtn" onclick="submitQuery()">Analyse &rarr;</button>
+        </div>
+    </div>
+
+    <div class="upload-bar">
+        <span class="upload-label">Own data:</span>
+        <div class="upload-files-area" id="uploadFilesArea"></div>
+        <button class="upload-add-btn" onclick="addFileSlot()">+ Add file</button>
+    </div>
+    <div class="upload-bar">
+        <span class="upload-label">Expert hint:</span>
+        <input type="text" id="domainHint"
+            placeholder="Optional: e.g. 'use 300m buffer for rivers', 'flood depth threshold = -200cm'"
+            style="flex:1; padding:8px 12px; border:1px solid #3a3a5c; border-radius:6px; background:#2a2a3e; color:white; font-size:13px; outline:none;">
+    </div>
+
+    <div class="main">
+        <div id="map">
+            <div class="legend" id="mapLegend">
+                <div style="font-weight:600;margin-bottom:4px">Ranking</div>
+                <div class="legend-bar"></div>
+                <div class="legend-labels"><span>Highest</span><span>Lowest</span></div>
+            </div>
+        </div>
+        <div class="sidebar">
+            <div class="status-bar">
+                <div id="statusText" class="status-idle">Ready — enter a question and click Analyse</div>
+                <div class="progress-steps" id="progressSteps"></div>
+            </div>
+            <div class="scores" id="scoresBar" style="display:none">
+                <div class="score-box">
+                    <div class="val" id="evalScore">&mdash;</div>
+                    <div class="lbl">Eval Score</div>
+                </div>
+                <div class="score-box">
+                    <div class="val" id="corrScore">&mdash;</div>
+                    <div class="lbl">GT Correlation</div>
+                </div>
+                <div class="score-box">
+                    <div class="val" id="timeScore">&mdash;</div>
+                    <div class="lbl">Time (s)</div>
+                </div>
+            </div>
+            <div class="methodology-box" id="methodologyBox">
+                <b>How was this computed?</b><br>
+                <span id="methodologyText"></span>
+            </div>
+            <div class="results-list" id="resultsList">
+                <div class="empty-state">
+                    <div>Submit a geographic question to see ranked results here</div>
+                </div>
+            </div>
+            <div class="paper-badge">
+                GoAI &mdash; Geographic AI Pipeline &bull; Powered by OpenStreetMap + WorldPop + Groq
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = 'http://localhost:8000';
+
+        let map, geojsonLayer;
+        let currentResults = [];
+        let pollInterval = null;
+        let statusCycleInterval = null;
+        let totalRowCount = 0;
+        let suggestionTimeout = null;
+        let selectedSuggestionIdx = -1;
+        let currentSessionId = null;
+        let uploadedFiles = [];
+        let slotCounter = 0;
+        let queryStartTime = null;      // ← track elapsed for simulated pills
+        let usingRealTrace = false;     // ← true once real trace arrives
+
+        // Step definitions shared by both simulated and real progress
+        const STEPS = ['memory_lookup', 'decompose', 'retrieve', 'analyse', 'evaluate', 'complete'];
+        const STEP_LABELS = {
+            memory_lookup: 'Memory',
+            decompose: 'Plan',
+            retrieve: 'Fetch',
+            analyse: 'Analyse',
+            evaluate: 'Score',
+            complete: 'Done'
+        };
+
+        // Rough elapsed-time thresholds (seconds) after which each step
+        // transitions from active → done during the simulation phase.
+        // These are conservative so we never show a step as done if it isn't.
+        const SIM_DONE_AT  = [3, 8, 35, 999, 999, 999];   // step i done after N s
+        const SIM_START_AT = [0, 3,  8,  35,  999, 999];  // step i becomes active after N s
+
+        const STATUS_MESSAGES = [
+            'Checking memory for similar tasks...',
+            'Decomposing your question...',
+            'Fetching geographic data from OpenStreetMap...',
+            'Running spatial analysis...',
+            'Evaluating results with LLM judge...'
+        ];
+
+        function getRankColor(rank, total) {
+            const ratio = (rank - 1) / Math.max(total - 1, 1);
+            let r, g, b;
+            if (ratio < 0.5) {
+                const t = ratio * 2;
+                r = Math.round(211 + (249 - 211) * t);
+                g = Math.round(47 + (168 - 47) * t);
+                b = Math.round(47 + (37 - 47) * t);
+            } else {
+                const t = (ratio - 0.5) * 2;
+                r = Math.round(249 + (46 - 249) * t);
+                g = Math.round(168 + (125 - 168) * t);
+                b = Math.round(37 + (50 - 37) * t);
+            }
+            return `rgb(${r},${g},${b})`;
+        }
+
+        function initMap() {
+            map = L.map('map').setView([20, 0], 2);
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+                attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+                maxZoom: 18
+            }).addTo(map);
+        }
+
+        async function fetchCitySuggestions(query) {
+            const box = document.getElementById('citySuggestions');
+            if (!query || query.length < 2) { box.style.display = 'none'; return; }
+            clearTimeout(suggestionTimeout);
+            suggestionTimeout = setTimeout(async () => {
+                try {
+                    const res = await fetch(
+                        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=6&addressdetails=0`,
+                        { headers: { 'Accept-Language': 'en' } }
+                    );
+                    const data = await res.json();
+                    if (!data.length) { box.style.display = 'none'; return; }
+                    selectedSuggestionIdx = -1;
+                    box.innerHTML = data.map((d, i) => `
+                        <div class="city-sug-item" id="sug-${i}"
+                             onclick="selectCitySuggestion('${d.display_name.replace(/'/g, "\\'")}')"
+                             onmouseover="highlightSuggestion(${i})">
+                            ${d.display_name}
+                        </div>`).join('');
+                    box.style.display = 'block';
+                } catch (e) { box.style.display = 'none'; }
+            }, 300);
+        }
+
+        function highlightSuggestion(idx) {
+            document.querySelectorAll('.city-sug-item').forEach((el, i) => {
+                el.classList.toggle('active', i === idx);
+            });
+            selectedSuggestionIdx = idx;
+        }
+
+        function selectCitySuggestion(displayName) {
+            const shortName = displayName.split(',')[0].trim();
+            document.getElementById('cityInput').value = shortName;
+            document.getElementById('citySuggestions').style.display = 'none';
+            zoomToCity(shortName);
+        }
+
+        function handleCityKey(event) {
+            const box = document.getElementById('citySuggestions');
+            const items = box.querySelectorAll('.city-sug-item');
+            if (!items.length) return;
+            if (event.key === 'ArrowDown') {
+                event.preventDefault();
+                selectedSuggestionIdx = Math.min(selectedSuggestionIdx + 1, items.length - 1);
+            } else if (event.key === 'ArrowUp') {
+                event.preventDefault();
+                selectedSuggestionIdx = Math.max(selectedSuggestionIdx - 1, 0);
+            } else if (event.key === 'Enter' && selectedSuggestionIdx >= 0) {
+                items[selectedSuggestionIdx].click();
+                event.stopPropagation();
+                return;
+            } else if (event.key === 'Escape') {
+                box.style.display = 'none';
+                return;
+            }
+            items.forEach((el, i) => el.classList.toggle('active', i === selectedSuggestionIdx));
+        }
+
+        function addFileSlot() {
+            const slotId = `slot-${slotCounter++}`;
+            const inputId = `file-input-${slotId}`;
+            const area = document.getElementById('uploadFilesArea');
+            const row = document.createElement('div');
+            row.className = 'upload-file-row';
+            row.id = slotId;
+            row.innerHTML = `
+                <input type="file" id="${inputId}" accept=".geojson,.json,.csv"
+                       onchange="handleFileSelect(event, '${slotId}')"/>
+                <span class="upload-file-label" onclick="document.getElementById('${inputId}').click()">
+                    Click to upload GeoJSON or CSV
+                </span>
+                <span class="upload-file-info" id="info-${slotId}"></span>
+                <span class="upload-file-remove" onclick="removeFileSlot('${slotId}')">&#x2715;</span>`;
+            area.appendChild(row);
+        }
+
+        function removeFileSlot(slotId) {
+            document.getElementById(slotId)?.remove();
+            uploadedFiles = uploadedFiles.filter(f => f.slotId !== slotId);
+            if (uploadedFiles.length === 0) currentSessionId = null;
+        }
+
+        async function handleFileSelect(event, slotId) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const row = document.getElementById(slotId);
+            const label = row.querySelector('.upload-file-label');
+            const info = document.getElementById(`info-${slotId}`);
+            label.textContent = `Uploading ${file.name}...`;
+            setStatus('running', `Uploading ${file.name}...`);
+            try {
+                if (!currentSessionId) {
+                    const res = await fetch(`${API}/upload/session`, { method: 'POST' });
+                    const data = await res.json();
+                    currentSessionId = data.session_id;
+                }
+                const city = document.getElementById('cityInput').value;
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('city', city);
+                formData.append('description', file.name);
+                formData.append('session_id', currentSessionId);
+                const res = await fetch(`${API}/upload`, { method: 'POST', body: formData });
+                const data = await res.json();
+                if (data.upload_id) {
+                    const fi = data.file_info || {};
+                    const rows = fi.rows || '?';
+                    const cols = (fi.columns || []).slice(0, 2).join(', ');
+                    row.classList.add('has-file');
+                    label.textContent = file.name;
+                    info.textContent = `${rows} rows | ${cols}${fi.columns?.length > 2 ? '...' : ''}`;
+                    uploadedFiles = uploadedFiles.filter(f => f.slotId !== slotId);
+                    uploadedFiles.push({ slotId, uploadId: data.upload_id, filename: file.name, info: fi });
+                    const count = uploadedFiles.length;
+                    setStatus('idle', `${count} file${count > 1 ? 's' : ''} loaded — ask a question about your data`);
+                } else {
+                    throw new Error(data.detail || 'Upload failed');
+                }
+            } catch (e) {
+                label.textContent = 'Upload failed — try again';
+                setStatus('failed', `Upload error: ${e.message}`);
+            }
+        }
+
+        function startStatusCycle() {
+            let idx = 0;
+            setStatus('running', STATUS_MESSAGES[0]);
+            statusCycleInterval = setInterval(() => {
+                idx = (idx + 1) % STATUS_MESSAGES.length;
+                setStatus('running', STATUS_MESSAGES[idx]);
+            }, 4000);
+        }
+
+        function stopStatusCycle() {
+            if (statusCycleInterval) {
+                clearInterval(statusCycleInterval);
+                statusCycleInterval = null;
+            }
+        }
+
+        // ── Simulated progress pills ───────────────────────────────────────────
+        // Shows animated pills based on elapsed time while real trace is unavailable.
+        function showSimulatedProgress() {
+            if (usingRealTrace) return;   // real trace took over — don't overwrite
+            const elapsed = queryStartTime ? (Date.now() - queryStartTime) / 1000 : 0;
+
+            const html = STEPS.map((s, i) => {
+                let cls = '';
+                if (elapsed >= SIM_DONE_AT[i]) {
+                    cls = 'done';
+                } else if (elapsed >= SIM_START_AT[i]) {
+                    cls = 'active';
+                }
+                return `<span class="step-pill ${cls}">${STEP_LABELS[s]}</span>`;
+            }).join('');
+
+            document.getElementById('progressSteps').innerHTML = html;
+        }
+
+        async function submitQuery() {
+            const task = document.getElementById('taskInput').value.trim();
+            const city = document.getElementById('cityInput').value.trim();
+            if (!task) return;
+
+            document.getElementById('submitBtn').disabled = true;
+            document.getElementById('scoresBar').style.display = 'none';
+            document.getElementById('methodologyBox').style.display = 'none';
+            document.getElementById('mapLegend').style.display = 'none';
+            document.getElementById('citySuggestions').style.display = 'none';
+            clearProgress();
+            clearMap();
+            showEmpty('Analysing your geographic question...');
+            totalRowCount = 0;
+            queryStartTime = Date.now();
+            usingRealTrace = false;
+
+            startStatusCycle();
+            // Start simulated pill animation immediately
+            showSimulatedProgress();
+
+            try {
+                const domainHint = document.getElementById('domainHint').value.trim();
+                const body = { task, city };
+                if (currentSessionId && uploadedFiles.length > 0) body.session_id = currentSessionId;
+                if (domainHint) body.domain_hint = domainHint;
+                const res = await fetch(`${API}/query`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                pollResult(data.task_id);
+            } catch (e) {
+                stopStatusCycle();
+                setStatus('failed', `Connection error: ${e.message}`);
+                showEmpty('Could not connect to the API. Is the server running?');
+                document.getElementById('submitBtn').disabled = false;
+                clearProgress();
+            }
+        }
+
+        function pollResult(taskId) {
+            if (pollInterval) clearInterval(pollInterval);
+            pollInterval = setInterval(async () => {
+                try {
+                    const res = await fetch(`${API}/query/${taskId}`);
+                    const data = await res.json();
+
+                    if (data.trace) {
+                        // Real trace available — switch from simulation to real data
+                        usingRealTrace = true;
+                        updateProgress(data.trace);
+                    } else {
+                        // Still running — keep animated simulation
+                        showSimulatedProgress();
+                    }
+
+                    if (data.status === 'complete') {
+                        clearInterval(pollInterval);
+                        stopStatusCycle();
+                        handleComplete(data);
+                    } else if (data.status === 'failed') {
+                        clearInterval(pollInterval);
+                        stopStatusCycle();
+                        let errMsg = 'Analysis failed';
+                        try {
+                            const r = JSON.parse(data.result);
+                            const err = r.error || '';
+                            const lines = err.split('\n').filter(l =>
+                                l.trim() && !l.includes('File "') && !l.includes('^^^^'));
+                            errMsg = lines[lines.length - 1] || errMsg;
+                            if (errMsg.length > 120) errMsg = errMsg.substring(0, 120) + '...';
+                        } catch (e) { }
+                        setStatus('failed', errMsg);
+                        showEmpty('Query failed — try a different question or city');
+                        zoomToCity(data.city);
+                        document.getElementById('submitBtn').disabled = false;
+                    }
+                } catch (e) {
+                    console.error('Poll error:', e);
+                }
+            }, 2000);
+        }
+
+        function updateProgress(trace) {
+            let traceData;
+            try {
+                traceData = typeof trace === 'string' ? JSON.parse(trace) : trace;
+            } catch (e) { return; }
+
+            const doneSteps = new Set(traceData.map(t => t.step));
+            const lastStep = traceData[traceData.length - 1];
+
+            const html = STEPS.map((s, i) => {
+                let cls = '';
+                let extra = '';
+                if (doneSteps.has(s)) {
+                    const stepData = traceData.find(t => t.step === s);
+                    cls = (stepData && stepData.status === 'failed') ? 'failed' : 'done';
+                    if (stepData && stepData.time_s) {
+                        extra = `<span style="font-size:9px;opacity:0.7"> ${stepData.time_s}s</span>`;
+                    }
+                    if (s === 'analyse' && stepData && stepData.attempts > 1) {
+                        extra += `<span style="font-size:9px;opacity:0.7"> (${stepData.attempts} attempts)</span>`;
+                    }
+                    if (stepData && stepData.message && s === lastStep?.step) {
+                        extra += `<span style="font-size:9px;opacity:0.7"> — ${stepData.message.substring(0, 60)}</span>`;
+                    }
+                } else if (i === doneSteps.size) {
+                    cls = 'active';
+                }
+                return `<span class="step-pill ${cls}">${STEP_LABELS[s]}${extra}</span>`;
+            }).join('');
+
+            document.getElementById('progressSteps').innerHTML = html;
+
+            if (lastStep && lastStep.status !== 'failed') {
+                if (lastStep.message) {
+                    stopStatusCycle();
+                    setStatus('running', `${STEP_LABELS[lastStep.step] || lastStep.step} — ${lastStep.message.substring(0, 80)}`);
+                }
+            }
+        }
+
+        function handleComplete(data) {
+            document.getElementById('submitBtn').disabled = false;
+            let result;
+            try {
+                result = JSON.parse(data.result);
+            } catch (e) {
+                setStatus('failed', 'Could not parse result');
+                return;
+            }
+
+            if (result.error && !result.output) {
+                const errLines = result.error.split('\n').filter(l =>
+                    l.trim() && !l.includes('File "') && !l.includes('^^^^'));
+                const errMsg = errLines[errLines.length - 1] || 'Analysis failed';
+                setStatus('failed', errMsg.substring(0, 120));
+                showEmpty('Query failed — try a different question or city');
+                document.getElementById('submitBtn').disabled = false;
+                return;
+            }
+
+            const totalTime = result.total_time_s || '?';
+            setStatus('complete', `Complete in ${totalTime}s`);
+            document.getElementById('scoresBar').style.display = 'flex';
+            document.getElementById('evalScore').textContent =
+                result.eval_score != null ? result.eval_score.toFixed(2) : '—';
+            document.getElementById('corrScore').textContent =
+                result.ground_truth_correlation != null
+                    ? result.ground_truth_correlation.toFixed(2) : 'N/A';
+            document.getElementById('timeScore').textContent = (result.total_time_s || '?') + 's';
+
+            if (result.methodology) {
+                document.getElementById('methodologyText').textContent = result.methodology;
+                document.getElementById('methodologyBox').style.display = 'block';
+            } else {
+                document.getElementById('methodologyBox').style.display = 'none';
+            }
+
+            const rowsMatch = (result.output || '').match(/ROWS:\s*(\d+)/);
+            totalRowCount = rowsMatch ? parseInt(rowsMatch[1]) : 0;
+            currentResults = parseOutput(result.output || '');
+
+            renderResults(currentResults, totalRowCount);
+            zoomToCity(data.city);
+            fetchAndRenderGeoJSON(data.task_id, currentResults, totalRowCount);
+        }
+
+        async function fetchAndRenderGeoJSON(taskId, results, totalCount) {
+            try {
+                const res = await fetch(`${API}/query/${taskId}/geojson`);
+                if (!res.ok) return;
+                const geojson = await res.json();
+                if (!geojson?.features?.length) return;
+                clearMap();
+                const total = totalCount || geojson.features.length;
+                geojsonLayer = L.geoJSON(geojson, {
+                    style: feature => {
+                        const rank = feature.properties?.rank || total;
+                        const colour = getRankColor(rank, total);
+                        return { fillColor: colour, fillOpacity: 0.6, color: '#fff', weight: 1.5, opacity: 0.9 };
+                    },
+                    onEachFeature: (feature, layer) => {
+                        const props = feature.properties || {};
+                        const name = props.ward_full || props.ward_name || props.area_name || props.name || 'Unknown';
+                        const rank = props.rank || '?';
+                        const match = results.find(r => r.name === name);
+                        const val = match ? match.value : '';
+                        layer.bindPopup(`<strong>#${rank} ${name}</strong><br>${val}`);
+                        layer.on('mouseover', () => layer.openPopup());
+                        layer.on('mouseout', () => layer.closePopup());
+                        layer.on('click', () => {
+                            const idx = results.findIndex(r => r.name === name);
+                            if (idx >= 0) selectResult(idx);
+                        });
+                    }
+                }).addTo(map);
+                map.fitBounds(geojsonLayer.getBounds(), { padding: [20, 20] });
+                document.getElementById('mapLegend').style.display = 'block';
+            } catch (e) {
+                console.warn('[Map] GeoJSON unavailable:', e.message);
+            }
+        }
+
+        function parseOutput(output) {
+            const results = [];
+            const lines = output.split('\n');
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (!line.startsWith('#')) continue;
+                let combined = line;
+                let j = i + 1;
+                while (j < lines.length && !lines[j].trim().startsWith('#') && j < i + 4) {
+                    combined += ' ' + lines[j].trim();
+                    j++;
+                }
+                combined = combined.replace(/\s+/g, ' ').trim();
+                const m = combined.match(/#(\d+)\s+(.+?):\s+(.+)/);
+                if (m) results.push({ rank: parseInt(m[1]), name: m[2].trim(), value: m[3].trim() });
+            }
+            return results;
+        }
+
+        function renderResults(results, totalCount) {
+            if (!results.length) {
+                showEmpty('Analysis complete — no ranked items found in output');
+                return;
+            }
+            const total = totalCount || results.length;
+            const html = results.map((r, i) => {
+                const colour = getRankColor(r.rank, total);
+                return `
+                    <div class="result-item" onclick="selectResult(${i})">
+                        <div class="rank-badge" style="background:${colour}">${r.rank}</div>
+                        <div class="result-info">
+                            <div class="result-name" title="${r.name}">${r.name}</div>
+                            <div class="result-val">${r.value}</div>
+                        </div>
+                    </div>`;
+            }).join('');
+            document.getElementById('resultsList').innerHTML = html;
+        }
+
+        function selectResult(idx) {
+            document.querySelectorAll('.result-item').forEach((el, i) => {
+                el.classList.toggle('active', i === idx);
+            });
+        }
+
+        async function zoomToCity(city) {
+            if (!city) return;
+            try {
+                const res = await fetch(
+                    `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1`,
+                    { headers: { 'Accept-Language': 'en' } }
+                );
+                const data = await res.json();
+                if (data?.length) map.setView([parseFloat(data[0].lat), parseFloat(data[0].lon)], 11);
+            } catch (e) {
+                map.setView([20, 0], 2);
+            }
+        }
+
+        function clearMap() {
+            if (geojsonLayer) { map.removeLayer(geojsonLayer); geojsonLayer = null; }
+            document.getElementById('mapLegend').style.display = 'none';
+        }
+
+        function setStatus(type, msg) {
+            const el = document.getElementById('statusText');
+            el.className = `status-${type}`;
+            el.textContent = msg;
+        }
+
+        function clearProgress() {
+            document.getElementById('progressSteps').innerHTML = '';
+        }
+
+        function showEmpty(msg) {
+            document.getElementById('resultsList').innerHTML =
+                `<div class="empty-state"><div>${msg}</div></div>`;
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initMap();
+            addFileSlot();
+            document.getElementById('taskInput').addEventListener('keydown', e => {
+                if (e.key === 'Enter') submitQuery();
+            });
+            document.addEventListener('click', e => {
+                if (!e.target.closest('.city-wrap')) {
+                    document.getElementById('citySuggestions').style.display = 'none';
+                }
+            });
+        });
+    </script>
+</body>
+
+</html>

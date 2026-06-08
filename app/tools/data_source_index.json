@@ -1,0 +1,6 @@
+{
+    "mumbai_wards": "Mumbai ward boundaries — 24 administrative ward polygons stored as a local GeoJSON file. Use this when the query is specifically about Mumbai wards.",
+    "lakes_and_rivers": "Mumbai polygon water bodies — lakes and river polygons exported from QGIS. Use this for Mumbai flood zone calculation involving standing water and river bodies.",
+    "river_lines_streams_drains": "Mumbai linear drainage network — rivers, streams, and drains as lines exported from QGIS. Use this for Mumbai flood zone calculation involving drainage channels.",
+    "openstreetmap": "Live OpenStreetMap data for any city in the world via the OSMnx library. Use this for any city other than Mumbai, or when you need parks, hospitals, roads, coastlines, green space, or any other geographic feature for any city worldwide."
+}

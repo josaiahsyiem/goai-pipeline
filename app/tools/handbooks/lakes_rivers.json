@@ -1,0 +1,17 @@
+{
+    "name": "lakes_and_rivers",
+    "description": "Mumbai polygon water bodies — lakes and river polygons exported from QGIS.",
+    "file_path": "/data/geojson_files/lakes_and_rivers.geojson",
+    "file_format": "geojson",
+    "crs": "EPSG:4326",
+    "geometry_type": "Polygon",
+    "key_columns": [
+        "ftype"
+    ],
+    "buffer_distances_metres": {
+        "lake": 200,
+        "river": 300
+    },
+    "notes": "Use ftype column to distinguish lakes from rivers and apply appropriate buffer sizes. Project to a metric CRS (e.g. EPSG:32643) before buffering. Some features may be MultiPolygon — use make_valid() before spatial operations.",
+    "example_code": "import geopandas as gpd\nfrom shapely.validation import make_valid\nlakes_rivers = gpd.read_file('/data/geojson_files/lakes_and_rivers.geojson')\nlakes_rivers['geometry'] = lakes_rivers['geometry'].apply(make_valid)\nprint(lakes_rivers[['ftype', 'geometry']].head())"
+}

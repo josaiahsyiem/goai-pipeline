@@ -1,0 +1,18 @@
+{
+    "name": "river_lines_streams_drains",
+    "description": "Mumbai linear drainage network — rivers, streams, and drains as lines exported from QGIS.",
+    "file_path": "/data/geojson_files/river_lines_streams_drains.geojson",
+    "file_format": "geojson",
+    "crs": "EPSG:4326",
+    "geometry_type": "LineString",
+    "key_columns": [
+        "ftype"
+    ],
+    "buffer_distances_metres": {
+        "river": 300,
+        "stream": 150,
+        "drain": 150
+    },
+    "notes": "Apply different buffer sizes based on the ftype column — rivers get 300m, streams and drains get 150m. This file contains linear features only, not polygons. Project to a metric CRS (e.g. EPSG:32643) before buffering.",
+    "example_code": "import geopandas as gpd\nfrom shapely.validation import make_valid\ndrains = gpd.read_file('/data/geojson_files/river_lines_streams_drains.geojson')\ndrains['geometry'] = drains['geometry'].apply(make_valid)\nprint(drains[['ftype', 'geometry']].head())"
+}
