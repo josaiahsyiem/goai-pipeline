@@ -31,6 +31,9 @@ from tools.handbook_registry import load_all_handbooks, load_data_source_index, 
 from tools.llm_client import smart_chat
 from tools.prompts import GIS_EXPERT_SYSTEM_PROMPT
 
+import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
+
 # ── Known local data paths ────────────────────────────────────────────────────
 
 KNOWN_LOCAL_SOURCES = {
@@ -69,7 +72,11 @@ MULTI_SOURCE_QUERIES = {
         "sources": ["osm_boundaries", "osm_greenspace", "osm_parks"],
     },
     "flood_risk": {
-        "keywords": ["flood risk", "flood zone", "flood exposure"],
+        "keywords": [
+            "flood risk", "flood zone", "flood exposure",
+            "flood", "flooding", "flood prone", "flood-prone",
+            "inundation", "waterlogging", "waterlogged",
+        ],
         "sources":  ["osm_boundaries", "osm_water"],
     },
     "schools": {
@@ -91,7 +98,7 @@ MULTI_SOURCE_QUERIES = {
             "transport", "transit", "bus stop", "metro", "subway",
             "public transport", "train station", "bus density",
             "transit accessibility", "transport access",
-            "accessibility", "public transport accessibility",
+            "public transport accessibility",
             "best transport", "transport score",
         ],
         "sources": ["osm_boundaries", "osm_transit"],
@@ -123,15 +130,16 @@ MULTI_SOURCE_QUERIES = {
         ],
         "sources": ["osm_boundaries", "osm_parking"],
     },
-    # FIX 1: per_capita no longer includes osm_hospitals — analysis agent
-    # fetches inline when hospital retrieval fails. Only boundaries needed here.
+    # per_capita fetches boundaries only — the analysis agent's per-capita path
+    # detects the requested feature from the task and fetches it inline.
+    # WorldPop is added by _ensure_per_capita_sources. Feature-specific entries
+    # (hospital_proximity, schools, transit_access) match first for their keywords.
     "per_capita": {
         "keywords": [
             "per capita", "per 100k", "per 1000", "per population",
             "per resident", "per person", "per 100000",
-            "hospitals per", "schools per", "transit per",
         ],
-        "sources": ["osm_boundaries", "osm_hospitals"],
+        "sources": ["osm_boundaries"],
     },
     # Specific POI queries — retrieval fetches boundaries only;
     # generic_engine handles the feature-specific OSM fetch.
@@ -160,6 +168,33 @@ MULTI_SOURCE_QUERIES = {
         ],
         "sources": ["osm_boundaries"],
     },
+    "satellite_uhi": {
+        "keywords": [
+            "heat island", "urban heat", "uhi", "surface temperature",
+            "land surface temperature", "lst", "thermal", "hot spot",
+            "hotspot", "heat map", "heat stress",
+        ],
+        "sources": ["osm_boundaries", "satellite_thermal"],
+    },
+    "satellite_vegetation": {
+        "keywords": [
+            "ndvi", "vegetation index", "vegetation health",
+            "greenness", "vegetation cover", "leaf area",
+        ],
+        "sources": ["osm_boundaries", "satellite_ndvi"],
+    },
+    "satellite_worldcover": {
+        "keywords": [
+            "land cover", "landcover", "land use", "lulc",
+            "green cover", "built-up", "built up", "urban area percentage",
+            "vegetation percentage", "tree cover", "bare soil",
+            "impervious surface", "esa worldcover", "worldcover",
+        ],
+        "sources": ["osm_boundaries", "satellite_worldcover"],
+    },
+    # NOTE: satellite_landcover/sentinel2 removed — it fetched only a STAC
+    # item_id with no raster and no analysis-side path. Reintroduce as a full
+    # feature (band download + classification + analysis path) when needed.
 }
 
 
@@ -189,18 +224,41 @@ def _ensure_per_capita_sources(sources: list, task_lower: str) -> list:
     return out
 
 
+# Deliberate prefix stems — match 'pharmacy', 'pharmacies', 'libraries', etc.
+_STEM_KEYWORDS = {"pharmac", "librar", "veterinar"}
+
+
+def _kw_match(kw: str, text: str) -> bool:
+    """Word-boundary keyword match. Prevents 'park' matching 'parking',
+    'garden' matching 'kindergarten', 'green' matching 'greenness',
+    'metro' matching 'metropolitan'. Stems keep open-ended suffixes."""
+    import re
+    tail = r'' if kw in _STEM_KEYWORDS else r'(?:s|es)?\b'
+    return re.search(r'\b' + re.escape(kw) + tail, text) is not None
+
+
 def detect_multi_source_query(task: str) -> list:
     import json as _json
     task_lower = task.lower()
     print(f"[Retrieval] Multi-source check: {task_lower}")
 
-    # First try keyword matching for speed
+    # First try keyword matching for speed.
+    # Most-specific-wins: check ALL keywords, prefer more words, then longer —
+    # so 'forest cover' (landcover) beats 'forest' (greenspace) and
+    # 'hospitals per' (hospital_proximity) beats 'per capita' (per_capita),
+    # regardless of registry order.
+    candidates = []
     for config in MULTI_SOURCE_QUERIES.values():
         for kw in config["keywords"]:
-            if kw in task_lower:
-                print(
-                    f"[Retrieval] Matched keyword: '{kw}' -> {config['sources']}")
-                return _ensure_per_capita_sources(config["sources"], task_lower)
+            if _kw_match(kw, task_lower):
+                candidates.append(
+                    (kw.count(" "), len(kw), kw, config["sources"]))
+    if candidates:
+        candidates.sort(reverse=True)
+        _, _, best_kw, best_sources = candidates[0]
+        print(
+            f"[Retrieval] Matched keyword: '{best_kw}' -> {best_sources}")
+        return _ensure_per_capita_sources(best_sources, task_lower)
 
     # Fallback — use LLM to decide sources for unknown query types
     print("[Retrieval] No keyword match — using LLM to select sources")
@@ -250,16 +308,21 @@ Example: ["osm_boundaries", "osm_greenspace"]"""
 
 # ── Deterministic OSMnx fetch code ───────────────────────────────────────────
 
+_PLACE_CACHE: dict = {}
+
+
 def generate_osmnx_fetch_code(source_type: str, city: str, task: str) -> str | None:
     place = city or "Mumbai"
+    if city in _PLACE_CACHE:
+        place = _PLACE_CACHE[city]
 
-    # FIX 2: get bounding box from Nominatim for more reliable OSMnx fetches
-    bbox = None
+    # Resolve a clean "City, Country" place string via Nominatim
     try:
         import requests
         res = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": city, "format": "json", "limit": 1},
+            params={"q": city, "format": "json", "limit": 1,
+                    "accept-language": "en"},
             headers={"User-Agent": "GoAI/1.0"},
             timeout=10,
         )
@@ -271,15 +334,19 @@ def generate_osmnx_fetch_code(source_type: str, city: str, task: str) -> str | N
                 + data[0].get("display_name", city).split(",")[-1].strip()
             )
             place = place.replace("'", "").replace('"', "").strip()
-            bb = data[0].get("boundingbox")
-            if bb and len(bb) == 4:
-                bbox = (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
+
     except Exception:
         pass
 
     # Sanitize place name — remove quotes that break f-string templates
     place = place.replace("'", "").replace('"', "").strip()
+    if city:
+        _PLACE_CACHE[city] = place
     city_name = place.split(",")[0].strip()
+    # Cache slug from the USER's city string — must mirror analysis_agent's
+    # fallback: plan city -> split(',')[0].strip().replace(' ', '_')
+    city_slug = (city or place).replace("'", "").replace(
+        '"', "").split(",")[0].strip().replace(" ", "_")
 
     # LLM-Find Feature #3: Load code templates from handbook
     # Paper: "providing a verified program template significantly increases accuracy"
@@ -304,6 +371,7 @@ def generate_osmnx_fetch_code(source_type: str, city: str, task: str) -> str | N
         # Inline Overpass + OSMnx fallback template
         return f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -326,7 +394,7 @@ def download_data():
     if gdf is None or len(gdf) == 0:
         try:
             import requests
-            res = requests.get('https://nominatim.openstreetmap.org/search', params={{'q': '{place}', 'format': 'json', 'limit': 1}}, headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
+            res = requests.get('https://nominatim.openstreetmap.org/search', params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}}, headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
             bb = res.json()[0].get('boundingbox', [])
             if len(bb) == 4:
                 gdf = _ffb(float(bb[1]), float(bb[0]), float(bb[3]), float(bb[2]), tags)
@@ -346,6 +414,7 @@ download_data()
             return code_templates["schools_overpass"].replace("{city_name}", city_name).replace("{place}", place)
         return f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -368,7 +437,7 @@ def download_data():
     if gdf is None or len(gdf) == 0:
         try:
             import requests
-            res = requests.get('https://nominatim.openstreetmap.org/search', params={{'q': '{place}', 'format': 'json', 'limit': 1}}, headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
+            res = requests.get('https://nominatim.openstreetmap.org/search', params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}}, headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
             bb = res.json()[0].get('boundingbox', [])
             if len(bb) == 4:
                 gdf = _ffb(float(bb[1]), float(bb[0]), float(bb[3]), float(bb[2]), tags)
@@ -391,17 +460,10 @@ download_data()
     if source_type == "osm_roads" and "roads" in code_templates:
         return code_templates["roads"].replace("{place}", place)
 
-    # bbox_code for other templates
-    bbox_code = ""
-    if bbox:
-        bbox_code = f"""
-# Try bbox approach first (more reliable than place name for dense cities)
-_bbox = ({bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]})  # south, north, west, east
-"""
-
     templates = {
         "osm_boundaries": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -417,7 +479,7 @@ def download_data():
     # Get city bbox from Nominatim
     import requests
     res = requests.get('https://nominatim.openstreetmap.org/search',
-        params={{'q': '{place}', 'format': 'json', 'limit': 1, 'polygon_geojson': 1}},
+        params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en', 'polygon_geojson': 1, 'accept-language': 'en'}},
         headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
     data = res.json()
     if not data:
@@ -426,19 +488,37 @@ def download_data():
     if len(bb) != 4:
         raise ValueError('No bounding box for {place}')
     south, north, west, east = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
-    cx = (west + east) / 2
-    cy = (south + north) / 2
+    # Use Nominatim's actual lat/lon as center, not bbox center.
+    # Bbox center is unreliable for cities with non-contiguous territory
+    # (e.g. Tokyo includes remote Pacific islands, making bbox span half of Japan).
+    # This fix generalizes to any city with outlying territories.
+    cy = float(data[0].get('lat', (south + north) / 2))
+    cx = float(data[0].get('lon', (west + east) / 2))
+    # Cap oversized bboxes to a metro-area span around the actual city center.
+    _max_span = 1.5
+    if (north - south) > _max_span or (east - west) > _max_span:
+        south, north = cy - _max_span / 2, cy + _max_span / 2
+        west, east = cx - _max_span / 2, cx + _max_span / 2
+        print(f'Bbox capped to {{_max_span}}deg around ({{cy:.3f}},{{cx:.3f}}): s={{south:.3f}} n={{north:.3f}} w={{west:.3f}} e={{east:.3f}}')
+    
     zone = int((cx + 180) / 6) + 1
     utm_crs = f'EPSG:{{32600 + zone if cy >= 0 else 32700 + zone}}'
     best = None
-    for level in ['8', '9', '10', '7', '6']:
+    best_score = 0
+    for level in ['9', '10', '8', '7', '6', '5']:
         try:
             tags = {{'boundary': 'administrative', 'admin_level': level}}
             try:
-                candidate = ox.features_from_place('{place}', tags=tags)
-            except Exception as _fp_e:
-                print(f'features_from_place lvl {{level}}: {{_fp_e}}')
                 candidate = _ffb(north, south, east, west, tags)
+                if len(candidate) == 0:
+                    raise ValueError('empty bbox result')
+            except Exception as _fp_e:
+                print(f'bbox fetch lvl {{level}} failed: {{_fp_e}}, trying features_from_place')
+                try:
+                    candidate = ox.features_from_place('{place}', tags=tags)
+                except Exception as _fp_e2:
+                    print(f'features_from_place lvl {{level}}: {{_fp_e2}}')
+                    continue
             candidate = candidate.reset_index(drop=True)
             if 'boundary' in candidate.columns:
                 candidate = candidate[candidate['boundary'] == 'administrative'].copy()
@@ -454,33 +534,81 @@ def download_data():
             if len(candidate) < 3:
                 continue
             candidate_utm = candidate.to_crs(utm_crs)
-            areas = candidate_utm.geometry.area
+            areas = candidate_utm.geometry.area / 1e6
             median_area = areas.median()
-            candidate = candidate[areas >= median_area * 0.1].copy().reset_index(drop=True)
-            if len(candidate) >= 3:
+            candidate = candidate[(areas >= median_area * 0.1) &
+                                  (areas <= median_area * 20)].copy().reset_index(drop=True)
+            if len(candidate) < 3:
+                continue
+            areas_filtered = candidate.to_crs(utm_crs).geometry.area / 1e6
+            ward_like = ((areas_filtered >= 0.1) & (areas_filtered <= 500)).sum()
+            score = int(ward_like)
+            print(f'Boundaries: admin_level={{level}}, {{len(candidate)}} features, score={{score}}')
+            if score > 0 and len(candidate) > 500:
+                keep_idx = areas_filtered[(areas_filtered >= 0.1) & (areas_filtered <= 500)].nlargest(500).index
+                candidate = candidate.loc[keep_idx].reset_index(drop=True)
+                score = len(candidate)
+                print(f'Capped to {{len(candidate)}} ward-sized units')
+            # Prefer more granular level: if same score, pick the one with more features
+            if score > best_score or (score == best_score and best is not None and len(candidate) > len(best)):
+                best_score = score
                 best = candidate
-                print(f'Boundaries: admin_level={{level}}, {{len(best)}} features')
-                break
         except Exception as e:
             print(f'Boundaries: level {{level}} failed: {{e}}')
             continue
     if best is None or len(best) < 3:
         raise ValueError('Could not find administrative boundaries for {place}')
+    print(f'Best level: {{len(best)}} features, score={{best_score}}')
     best['geometry'] = best['geometry'].apply(make_valid)
 
-    # V2-2: clip to the city's own polygon so admin units outside the
-    # city (e.g. Hertfordshire parishes inside a London bbox) are dropped
+    # V4: city clip with 3-tier polygon source — NEVER silently skipped.
+    # Tier 1: Nominatim polygon. Tier 2: OSMnx geocode_to_gdf polygon.
+    # Tier 3: bbox rectangle (coarse, but strictly better than no clip).
+    city_poly = None
     try:
         from shapely.geometry import shape as _shape
         geojson = data[0].get('geojson')
-        if geojson:
+        if geojson and geojson.get('type') in ('Polygon', 'MultiPolygon'):
             city_poly = make_valid(_shape(geojson))
-            before = len(best)
-            keep = best.geometry.centroid.within(city_poly)
-            best = best[keep.values].copy().reset_index(drop=True)
-            print(f'City clip: {{before}} -> {{len(best)}} units inside {place}')
+            print('City polygon: Nominatim')
     except Exception as _ce:
-        print(f'city clip skipped: {{_ce}}')
+        print(f'Nominatim polygon failed: {{_ce}}')
+    if city_poly is None:
+        try:
+            _cg = ox.geocode_to_gdf('{place}')
+            _g0 = make_valid(_cg.geometry.iloc[0])
+            if _g0.geom_type in ('Polygon', 'MultiPolygon'):
+                city_poly = _g0
+                print('City polygon: OSMnx geocode_to_gdf')
+        except Exception as _ce2:
+            print(f'geocode_to_gdf polygon failed: {{_ce2}}')
+    if city_poly is None:
+        from shapely.geometry import box as _bbox_box
+        city_poly = _bbox_box(west, south, east, north)
+        print('City polygon: bbox fallback (coarse)')
+    before = len(best)
+    keep = best.geometry.centroid.within(city_poly)
+    best = best[keep.values].copy().reset_index(drop=True)
+    print(f'City clip: {{before}} -> {{len(best)}} units inside {place}')
+
+    # Step 2: remove area outliers (state/region boundaries mixed in)
+    best_utm = best.to_crs(utm_crs)
+    best['_area_km2'] = (best_utm.geometry.area / 1e6)
+    area_median = best['_area_km2'].median()
+    before = len(best)
+    best = best[best['_area_km2'] <= area_median * 8].copy().reset_index(drop=True)
+    if len(best) < before:
+        print(f'Area filter: {{before}} -> {{len(best)}} (removed {{before - len(best)}} oversized units)')
+
+    # Step 3: remove the city-level boundary itself (e.g. "Berlin" row in Berlin query)
+    if 'name' in best.columns:
+        city_name_lower = '{place}'.split(',')[0].strip().lower()
+        best = best[best['name'].str.lower().str.strip() != city_name_lower].copy().reset_index(drop=True)
+
+    best = best.drop(columns=['_area_km2'], errors='ignore')
+
+    if len(best) < 3:
+        raise ValueError('Too few boundaries after filtering for {place}')
 
     result = best.to_crs('EPSG:4326')
 
@@ -488,6 +616,7 @@ download_data()
 """,
         "osm_roads": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -500,7 +629,19 @@ def _ffb(_n, _s, _e, _w, _tags):
 
 def download_data():
     global result
-    G     = ox.graph_from_place('{place}', network_type='drive')
+    try:
+        G = ox.graph_from_place('{place}', network_type='drive')
+    except Exception as _gp_e:
+        print('place geocode failed (' + str(_gp_e)[:80] + ') — bbox graph fallback')
+        import requests as _rq
+        _nm = _rq.get('https://nominatim.openstreetmap.org/search',
+            params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}},
+            headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+        _bb = _nm[0]['boundingbox']
+        if int(str(ox.__version__).split('.')[0]) >= 2:
+            G = ox.graph_from_bbox((float(_bb[2]), float(_bb[0]), float(_bb[3]), float(_bb[1])), network_type='drive')
+        else:
+            G = ox.graph_from_bbox(north=float(_bb[1]), south=float(_bb[0]), east=float(_bb[3]), west=float(_bb[2]), network_type='drive')
     edges = ox.graph_to_gdfs(G, nodes=False)
     edges = edges.reset_index()
     edges['geometry'] = edges['geometry'].apply(make_valid)
@@ -510,6 +651,7 @@ download_data()
 """,
         "osm_hospitals": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -532,7 +674,7 @@ def download_data():
     if gdf is None or len(gdf) == 0:
         try:
             import requests
-            res = requests.get('https://nominatim.openstreetmap.org/search', params={{'q': '{place}', 'format': 'json', 'limit': 1}}, headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
+            res = requests.get('https://nominatim.openstreetmap.org/search', params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}}, headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
             bb = res.json()[0].get('boundingbox', [])
             if len(bb) == 4:
                 gdf = _ffb(float(bb[1]), float(bb[0]), float(bb[3]), float(bb[2]), tags)
@@ -548,6 +690,7 @@ download_data()
 """,
         "osm_parks": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -561,7 +704,16 @@ def _ffb(_n, _s, _e, _w, _tags):
 def download_data():
     global result
     tags = {{'leisure': 'park', 'landuse': ['forest', 'grass', 'recreation_ground']}}
-    gdf  = ox.features_from_place('{place}', tags)
+    try:
+        gdf = ox.features_from_place('{place}', tags)
+    except Exception as _fp_e:
+        print('place geocode failed (' + str(_fp_e)[:80] + ') — bbox fallback')
+        import requests as _rq
+        _nm = _rq.get('https://nominatim.openstreetmap.org/search',
+            params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}},
+            headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+        _bb = _nm[0]['boundingbox']
+        gdf = _ffb(float(_bb[1]), float(_bb[0]), float(_bb[3]), float(_bb[2]), tags)
     gdf  = gdf.reset_index()
     gdf  = gdf[gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])].copy()
     gdf['geometry'] = gdf['geometry'].apply(make_valid)
@@ -571,6 +723,7 @@ download_data()
 """,
         "osm_water": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -584,7 +737,16 @@ def _ffb(_n, _s, _e, _w, _tags):
 def download_data():
     global result
     tags = {{'natural': ['water', 'coastline'], 'waterway': ['river', 'stream', 'drain']}}
-    gdf  = ox.features_from_place('{place}', tags)
+    try:
+        gdf = ox.features_from_place('{place}', tags)
+    except Exception as _fp_e:
+        print('place geocode failed (' + str(_fp_e)[:80] + ') — bbox fallback')
+        import requests as _rq
+        _nm = _rq.get('https://nominatim.openstreetmap.org/search',
+            params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}},
+            headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+        _bb = _nm[0]['boundingbox']
+        gdf = _ffb(float(_bb[1]), float(_bb[0]), float(_bb[3]), float(_bb[2]), tags)
     gdf  = gdf.reset_index()
     gdf['geometry'] = gdf['geometry'].apply(make_valid)
     result = gdf.to_crs('EPSG:4326')
@@ -593,6 +755,7 @@ download_data()
 """,
         "osm_greenspace": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -606,7 +769,16 @@ def _ffb(_n, _s, _e, _w, _tags):
 def download_data():
     global result
     tags = {{'leisure': 'park', 'landuse': ['forest', 'grass', 'recreation_ground', 'meadow']}}
-    gdf  = ox.features_from_place('{place}', tags)
+    try:
+        gdf = ox.features_from_place('{place}', tags)
+    except Exception as _fp_e:
+        print('place geocode failed (' + str(_fp_e)[:80] + ') — bbox fallback')
+        import requests as _rq
+        _nm = _rq.get('https://nominatim.openstreetmap.org/search',
+            params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}},
+            headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+        _bb = _nm[0]['boundingbox']
+        gdf = _ffb(float(_bb[1]), float(_bb[0]), float(_bb[3]), float(_bb[2]), tags)
     gdf  = gdf.reset_index()
     gdf  = gdf[gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])].copy()
     gdf['geometry'] = gdf['geometry'].apply(make_valid)
@@ -616,6 +788,7 @@ download_data()
 """,
         "osm_schools": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -638,7 +811,7 @@ def download_data():
     if gdf is None or len(gdf) == 0:
         try:
             import requests
-            res = requests.get('https://nominatim.openstreetmap.org/search', params={{'q': '{place}', 'format': 'json', 'limit': 1}}, headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
+            res = requests.get('https://nominatim.openstreetmap.org/search', params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}}, headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
             bb = res.json()[0].get('boundingbox', [])
             if len(bb) == 4:
                 gdf = _ffb(float(bb[1]), float(bb[0]), float(bb[3]), float(bb[2]), tags)
@@ -654,6 +827,7 @@ download_data()
 """,
         "osm_transit": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -669,7 +843,16 @@ def download_data():
     tags = {{'public_transport': ['stop_position', 'station', 'platform'],
              'highway': ['bus_stop'],
              'railway': ['station', 'halt', 'tram_stop', 'subway_entrance']}}
-    gdf  = ox.features_from_place('{place}', tags)
+    try:
+        gdf = ox.features_from_place('{place}', tags)
+    except Exception as _fp_e:
+        print('place geocode failed (' + str(_fp_e)[:80] + ') — bbox fallback')
+        import requests as _rq
+        _nm = _rq.get('https://nominatim.openstreetmap.org/search',
+            params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}},
+            headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+        _bb = _nm[0]['boundingbox']
+        gdf = _ffb(float(_bb[1]), float(_bb[0]), float(_bb[3]), float(_bb[2]), tags)
     gdf  = gdf.reset_index()
     gdf['geometry'] = gdf['geometry'].apply(make_valid)
     result = gdf.to_crs('EPSG:4326')
@@ -678,6 +861,7 @@ download_data()
 """,
         "osm_commercial": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -691,7 +875,16 @@ def _ffb(_n, _s, _e, _w, _tags):
 def download_data():
     global result
     tags = {{'shop': True, 'amenity': ['bank', 'restaurant', 'cafe', 'fast_food']}}
-    gdf  = ox.features_from_place('{place}', tags)
+    try:
+        gdf = ox.features_from_place('{place}', tags)
+    except Exception as _fp_e:
+        print('place geocode failed (' + str(_fp_e)[:80] + ') — bbox fallback')
+        import requests as _rq
+        _nm = _rq.get('https://nominatim.openstreetmap.org/search',
+            params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}},
+            headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+        _bb = _nm[0]['boundingbox']
+        gdf = _ffb(float(_bb[1]), float(_bb[0]), float(_bb[3]), float(_bb[2]), tags)
     gdf  = gdf.reset_index()
     gdf['geometry'] = gdf['geometry'].apply(make_valid)
     result = gdf.to_crs('EPSG:4326')
@@ -700,6 +893,7 @@ download_data()
 """,
         "osm_cycling": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -718,7 +912,16 @@ def download_data():
         edges = edges.reset_index()
     except Exception:
         tags = {{'highway': ['cycleway', 'path'], 'bicycle': ['designated', 'yes']}}
-        edges = ox.features_from_place('{place}', tags)
+        try:
+            edges = ox.features_from_place('{place}', tags)
+        except Exception as _fp_e:
+            print('place geocode failed (' + str(_fp_e)[:80] + ') — bbox fallback')
+            import requests as _rq
+            _nm = _rq.get('https://nominatim.openstreetmap.org/search',
+                params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}},
+                headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+            _bb = _nm[0]['boundingbox']
+            edges = _ffb(float(_bb[1]), float(_bb[0]), float(_bb[3]), float(_bb[2]), tags)
         edges = edges.reset_index()
     edges['geometry'] = edges['geometry'].apply(make_valid)
     result = edges.to_crs('EPSG:4326')
@@ -727,6 +930,7 @@ download_data()
 """,
         "osm_parking": f"""
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import geopandas as gpd
 from shapely.validation import make_valid
 import warnings
@@ -740,7 +944,16 @@ def _ffb(_n, _s, _e, _w, _tags):
 def download_data():
     global result
     tags = {{'amenity': ['parking', 'parking_space', 'parking_entrance']}}
-    gdf  = ox.features_from_place('{place}', tags)
+    try:
+        gdf = ox.features_from_place('{place}', tags)
+    except Exception as _fp_e:
+        print('place geocode failed (' + str(_fp_e)[:80] + ') — bbox fallback')
+        import requests as _rq
+        _nm = _rq.get('https://nominatim.openstreetmap.org/search',
+            params={{'q': '{place}', 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en'}},
+            headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+        _bb = _nm[0]['boundingbox']
+        gdf = _ffb(float(_bb[1]), float(_bb[0]), float(_bb[3]), float(_bb[2]), tags)
     gdf  = gdf.reset_index()
     gdf['geometry'] = gdf['geometry'].apply(make_valid)
     result = gdf.to_crs('EPSG:4326')
@@ -822,8 +1035,38 @@ def download_data():
         'kyiv': 'UKR', 'kharkiv': 'UKR', 'almaty': 'KAZ', 'tashkent': 'UZB',
     }}
 
+    _ISO2_TO_ISO3 = {{
+        'in': 'IND', 'gb': 'GBR', 'de': 'DEU', 'fr': 'FRA', 'nl': 'NLD',
+        'es': 'ESP', 'it': 'ITA', 'at': 'AUT', 'ch': 'CHE', 'be': 'BEL',
+        'se': 'SWE', 'no': 'NOR', 'dk': 'DNK', 'pl': 'POL', 'cz': 'CZE',
+        'hu': 'HUN', 'pt': 'PRT', 'gr': 'GRC', 'ie': 'IRL', 'fi': 'FIN',
+        'ro': 'ROU', 'hr': 'HRV', 'sg': 'SGP', 'jp': 'JPN', 'kr': 'KOR',
+        'th': 'THA', 'id': 'IDN', 'my': 'MYS', 'ph': 'PHL', 'vn': 'VNM',
+        'cn': 'CHN', 'tw': 'TWN', 'hk': 'HKG', 'bd': 'BGD', 'pk': 'PAK',
+        'lk': 'LKA', 'np': 'NPL', 'mm': 'MMR', 'ae': 'ARE', 'qa': 'QAT',
+        'kw': 'KWT', 'om': 'OMN', 'tr': 'TUR', 'sa': 'SAU', 'eg': 'EGY',
+        'ir': 'IRN', 'iq': 'IRQ', 'il': 'ISR', 'jo': 'JOR', 'lb': 'LBN',
+        'ng': 'NGA', 'ke': 'KEN', 'za': 'ZAF', 'gh': 'GHA', 'tz': 'TZA',
+        'et': 'ETH', 'ma': 'MAR', 'tn': 'TUN', 'dz': 'DZA', 'ug': 'UGA',
+        'cd': 'COD', 'ao': 'AGO', 'us': 'USA', 'ca': 'CAN', 'br': 'BRA',
+        'ar': 'ARG', 'mx': 'MEX', 'co': 'COL', 'pe': 'PER', 'cl': 'CHL',
+        've': 'VEN', 'ec': 'ECU', 'bo': 'BOL', 'au': 'AUS', 'nz': 'NZL',
+        'ru': 'RUS', 'ua': 'UKR', 'kz': 'KAZ', 'uz': 'UZB',
+    }}
     city_lower = '{place}'.lower().split(',')[0].strip()
     iso3 = CITY_ISO3.get(city_lower, None)
+    if iso3 is None:
+        try:
+            _nom = requests.get('https://nominatim.openstreetmap.org/search',
+                params={{'q': city_lower, 'format': 'json', 'limit': 1, 'accept-language': 'en', 'accept-language': 'en', 'addressdetails': 1}},
+                headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10).json()
+            if _nom:
+                _cc = _nom[0].get('address', {{}}).get('country_code', '').lower()
+                iso3 = _ISO2_TO_ISO3.get(_cc)
+                if iso3:
+                    print(f"WorldPop: resolved '{{city_lower}}' -> {{iso3}} via Nominatim")
+        except Exception as _re:
+            print(f"WorldPop: Nominatim resolve failed: {{_re}}")
     if iso3 is None:
         print(f"WorldPop: unknown city '{{city_lower}}', defaulting to IND")
         iso3 = 'IND'
@@ -859,57 +1102,351 @@ def download_data():
 
 download_data()
 """,
+
+        "satellite_ndvi": """
+import planetary_computer
+import pystac_client
+import rasterio
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import requests
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+def download_data():
+    global result
+    place = '__PLACE__'
+    nom_params = dict(q=place, format='json', limit=1)
+    res = requests.get('https://nominatim.openstreetmap.org/search',
+        params=nom_params, headers={'User-Agent': 'GoAI/1.0'}, timeout=10)
+    data = res.json()
+    if not data:
+        raise ValueError('Nominatim returned nothing for ' + place)
+    bb = data[0]['boundingbox']
+    south, north, west, east = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+    bbox = [west, south, east, north]
+    city_name = '__CITYSLUG__'
+    cache_path = '/data/processed/ndvi_' + city_name + '.tif'
+    os.makedirs('/data/processed', exist_ok=True)
+
+    def _summer_window(s, n):
+        from datetime import date
+        lat_mid = (s + n) / 2
+        today = date.today()
+        if lat_mid >= 0:
+            # Northern summer Jun-Sep; use last completed one
+            y = today.year if today.month > 9 else today.year - 1
+            return str(y) + '-06-01/' + str(y) + '-09-30'
+        # Southern summer Dec-Mar; use last completed one
+        y = today.year if today.month > 3 else today.year - 1
+        return str(y - 1) + '-12-01/' + str(y) + '-03-31'
+
+    if not os.path.exists(cache_path):
+        catalog = pystac_client.Client.open(
+            'https://planetarycomputer.microsoft.com/api/stac/v1',
+            modifier=planetary_computer.sign_inplace)
+        search = catalog.search(
+            collections=['landsat-c2-l2'],
+            bbox=bbox,
+            datetime=_summer_window(south, north),
+            query={'eo:cloud_cover': {'lt': 20},
+                   'platform': {'in': ['landsat-8', 'landsat-9']}},
+            max_items=10)
+        items = list(search.items())
+        if not items:
+            raise ValueError('No Landsat scenes found for ' + place)
+        def _overlap_frac(it):
+            try:
+                ib = it.bbox
+                ix = max(0.0, min(ib[2], bbox[2]) - max(ib[0], bbox[0]))
+                iy = max(0.0, min(ib[3], bbox[3]) - max(ib[1], bbox[1]))
+                city_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                return (ix * iy) / city_area if city_area > 0 else 0.0
+            except Exception:
+                return 0.0
+        items.sort(key=lambda it: (-_overlap_frac(it),
+                   it.properties.get('eo:cloud_cover', 100)))
+        item = items[0]
+        print('Scene: ' + item.id + ', coverage=' + str(round(_overlap_frac(item), 2))
+              + ', cloud=' + str(item.properties.get('eo:cloud_cover')))
+        signed = planetary_computer.sign(item)
+        nir_href = signed.assets['nir08'].href
+        red_href = signed.assets['red'].href
+        print('Downloading NIR+Red bands...')
+        from rasterio.warp import calculate_default_transform, reproject, Resampling
+        from rasterio.mask import mask as rio_mask
+        from shapely.geometry import box as _box
+        import os as _os
+        dst_crs = 'EPSG:4326'
+        city_geom = [_box(*bbox)]
+        def _reproject_clip(href, tmp_path):
+            try:
+                with rasterio.open(href) as src:
+                    transform, width, height = calculate_default_transform(
+                        src.crs, dst_crs, src.width, src.height, *src.bounds,
+                        dst_width=3000, dst_height=3000)
+                    meta = src.meta.copy()
+                    meta.update({'crs': dst_crs, 'transform': transform,
+                                 'width': width, 'height': height, 'driver': 'GTiff', 'dtype': 'float32'})
+                    with rasterio.open(tmp_path, 'w', **meta) as tmp:
+                        reproject(source=rasterio.band(src, 1),
+                                  destination=rasterio.band(tmp, 1),
+                                  src_transform=src.transform,
+                                  src_crs=src.crs,
+                                  dst_transform=transform,
+                                  dst_crs=dst_crs,
+                                  resampling=Resampling.nearest)
+                with rasterio.open(tmp_path) as tmp:
+                    clipped, clipped_transform = rio_mask(tmp, city_geom, crop=True)
+            finally:
+                if _os.path.exists(tmp_path):
+                    _os.remove(tmp_path)
+            return clipped[0].astype(float), clipped_transform
+        nir, clip_transform = _reproject_clip(nir_href, cache_path + '.nir' + str(_os.getpid()) + '.tif')
+        red, _red_t = _reproject_clip(red_href, cache_path + '.red' + str(_os.getpid()) + '.tif')
+        ndvi = np.where((nir + red) > 0, (nir - red) / (nir + red), np.nan).astype(np.float32)
+        _part = cache_path + '.part' + str(_os.getpid()) + '.tif'
+        with rasterio.open(_part, 'w', driver='GTiff',
+                           height=ndvi.shape[0], width=ndvi.shape[1],
+                           count=1, dtype='float32', crs=dst_crs,
+                           transform=clip_transform) as dst:
+            dst.write(ndvi, 1)
+        _os.replace(_part, cache_path)
+        print('NDVI raster saved: ' + cache_path)
+    else:
+        print('NDVI raster cached: ' + cache_path)
+
+    result = gpd.GeoDataFrame(
+        pd.DataFrame([{'tif_path': cache_path, 'source': 'landsat_ndvi'}]),
+        geometry=gpd.points_from_xy([0], [0]), crs='EPSG:4326')
+    print('tif_path=' + cache_path)
+
+download_data()
+""".replace("__PLACE__", place).replace("__CITYSLUG__", city_slug),
+
+        "satellite_thermal": """
+import planetary_computer
+import pystac_client
+import rasterio
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import requests
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+def download_data():
+    global result
+    place = '__PLACE__'
+    nom_params = dict(q=place, format='json', limit=1)
+    res = requests.get('https://nominatim.openstreetmap.org/search',
+        params=nom_params, headers={'User-Agent': 'GoAI/1.0'}, timeout=10)
+    data = res.json()
+    if not data:
+        raise ValueError('Nominatim returned nothing for ' + place)
+    bb = data[0]['boundingbox']
+    south, north, west, east = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+    bbox = [west, south, east, north]
+    city_name = '__CITYSLUG__'
+    cache_path = '/data/processed/lst_' + city_name + '.tif'
+    os.makedirs('/data/processed', exist_ok=True)
+
+    def _summer_window(s, n):
+        from datetime import date
+        lat_mid = (s + n) / 2
+        today = date.today()
+        if 0 <= lat_mid <= 30:
+            # Monsoon belt (India, SE Asia, Sahel): pre-monsoon Mar-May —
+            # peak land surface temps AND clear skies (Jun-Sep = clouds)
+            y = today.year if today.month > 5 else today.year - 1
+            return str(y) + '-03-01/' + str(y) + '-05-31'
+        if lat_mid > 0:
+            y = today.year if today.month > 9 else today.year - 1
+            return str(y) + '-06-01/' + str(y) + '-09-30'
+        y = today.year if today.month > 3 else today.year - 1
+        return str(y - 1) + '-12-01/' + str(y) + '-03-31'
+
+    if not os.path.exists(cache_path):
+        catalog = pystac_client.Client.open(
+            'https://planetarycomputer.microsoft.com/api/stac/v1',
+            modifier=planetary_computer.sign_inplace)
+        search = catalog.search(
+            collections=['landsat-c2-l2'],
+            bbox=bbox,
+            datetime=_summer_window(south, north),
+            query={'eo:cloud_cover': {'lt': 20},
+                   'platform': {'in': ['landsat-8', 'landsat-9']}},
+            max_items=10)
+        items = list(search.items())
+        if not items:
+            raise ValueError('No Landsat scenes found for ' + place)
+        def _overlap_frac(it):
+            try:
+                ib = it.bbox
+                ix = max(0.0, min(ib[2], bbox[2]) - max(ib[0], bbox[0]))
+                iy = max(0.0, min(ib[3], bbox[3]) - max(ib[1], bbox[1]))
+                city_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                return (ix * iy) / city_area if city_area > 0 else 0.0
+            except Exception:
+                return 0.0
+        items.sort(key=lambda it: (-_overlap_frac(it),
+                   it.properties.get('eo:cloud_cover', 100)))
+        item = items[0]
+        print('Scene: ' + item.id + ', coverage=' + str(round(_overlap_frac(item), 2))
+              + ', cloud=' + str(item.properties.get('eo:cloud_cover')))
+        signed = planetary_computer.sign(item)
+        thermal_href = signed.assets['lwir11'].href if 'lwir11' in signed.assets else signed.assets['lwir'].href
+        print('Downloading thermal band...')
+        from rasterio.warp import calculate_default_transform, reproject, Resampling
+        from rasterio.mask import mask as rio_mask
+        from shapely.geometry import box as _box
+        import os as _os
+        tmp_path = cache_path + '.tmp' + str(_os.getpid()) + '.tif'
+        with rasterio.open(thermal_href) as src:
+            dst_crs = 'EPSG:4326'
+            transform, width, height = calculate_default_transform(
+                src.crs, dst_crs, src.width, src.height, *src.bounds,
+                dst_width=3000, dst_height=3000)
+            meta = src.meta.copy()
+            meta.update({'crs': dst_crs, 'transform': transform,
+                         'width': width, 'height': height, 'driver': 'GTiff'})
+            with rasterio.open(tmp_path, 'w', **meta) as tmp:
+                reproject(source=rasterio.band(src, 1),
+                          destination=rasterio.band(tmp, 1),
+                          src_transform=src.transform,
+                          src_crs=src.crs,
+                          dst_transform=transform,
+                          dst_crs=dst_crs,
+                          resampling=Resampling.nearest)
+        with rasterio.open(tmp_path) as tmp:
+            city_geom = [_box(*bbox)]
+            clipped, clipped_transform = rio_mask(tmp, city_geom, crop=True)
+            clipped_meta = tmp.meta.copy()
+            clipped_meta.update({'height': clipped.shape[1],
+                                 'width': clipped.shape[2],
+                                 'transform': clipped_transform})
+        _part = cache_path + '.part' + str(_os.getpid()) + '.tif'
+        with rasterio.open(_part, 'w', **clipped_meta) as dst:
+            dst.write(clipped)
+        _os.replace(_part, cache_path)
+        _os.remove(tmp_path)
+        print('LST raster saved: ' + cache_path)
+    else:
+        print('LST raster cached: ' + cache_path)
+
+    result = gpd.GeoDataFrame(
+        pd.DataFrame([{'tif_path': cache_path, 'source': 'landsat_lst'}]),
+        geometry=gpd.points_from_xy([0], [0]), crs='EPSG:4326')
+    print('tif_path=' + cache_path)
+
+download_data()
+""".replace("__PLACE__", place).replace("__CITYSLUG__", city_slug),
+        "satellite_worldcover": """
+import planetary_computer
+import pystac_client
+import rasterio
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import requests
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+def download_data():
+    global result
+    place = '__PLACE__'
+    nom_params = dict(q=place, format='json', limit=1)
+    res = requests.get('https://nominatim.openstreetmap.org/search',
+        params=nom_params, headers={'User-Agent': 'GoAI/1.0'}, timeout=10)
+    data = res.json()
+    if not data:
+        raise ValueError('Nominatim returned nothing for ' + place)
+    bb = data[0]['boundingbox']
+    south, north, west, east = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+    # Cap oversized bbox
+    cy, cx = float(data[0]['lat']), float(data[0]['lon'])
+    _ms = 1.5
+    if (north - south) > _ms or (east - west) > _ms:
+        south, north = cy - _ms/2, cy + _ms/2
+        west, east = cx - _ms/2, cx + _ms/2
+    bbox = [west, south, east, north]
+    city_slug = '__CITYSLUG__'
+    cache_path = '/data/processed/worldcover_' + city_slug + '.tif'
+    os.makedirs('/data/processed', exist_ok=True)
+
+    if not os.path.exists(cache_path):
+        catalog = pystac_client.Client.open(
+            'https://planetarycomputer.microsoft.com/api/stac/v1',
+            modifier=planetary_computer.sign_inplace)
+        search = catalog.search(
+            collections=['io-lulc-annual-v02'],
+            bbox=bbox,
+            datetime='2022-01-01/2022-12-31',
+            max_items=5)
+        items = list(search.items())
+        if not items:
+            raise ValueError('No ESA WorldCover data found for ' + place)
+        item = items[0]
+        print('WorldCover scene: ' + item.id)
+        signed = planetary_computer.sign(item)
+        band_href = signed.assets['data'].href
+        print('Downloading WorldCover band...')
+        from rasterio.warp import calculate_default_transform, reproject, Resampling
+        from rasterio.mask import mask as rio_mask
+        from shapely.geometry import box as _box
+        import os as _os
+        tmp_path = cache_path + '.tmp' + str(_os.getpid()) + '.tif'
+        with rasterio.open(band_href) as src:
+            dst_crs = 'EPSG:4326'
+            transform, width, height = calculate_default_transform(
+                src.crs, dst_crs, src.width, src.height, *src.bounds,
+                dst_width=2000, dst_height=2000)
+            meta = src.meta.copy()
+            meta.update({'crs': dst_crs, 'transform': transform,
+                         'width': width, 'height': height, 'driver': 'GTiff'})
+            with rasterio.open(tmp_path, 'w', **meta) as tmp:
+                reproject(source=rasterio.band(src, 1),
+                          destination=rasterio.band(tmp, 1),
+                          src_transform=src.transform,
+                          src_crs=src.crs,
+                          dst_transform=transform,
+                          dst_crs=dst_crs,
+                          resampling=Resampling.nearest)
+        from rasterio.mask import mask as rio_mask
+        from shapely.geometry import box as _box
+        with rasterio.open(tmp_path) as tmp:
+            city_geom = [_box(*bbox)]
+            clipped, clipped_transform = rio_mask(tmp, city_geom, crop=True)
+            clipped_meta = tmp.meta.copy()
+            clipped_meta.update({'height': clipped.shape[1],
+                                 'width': clipped.shape[2],
+                                 'transform': clipped_transform})
+            with rasterio.open(cache_path, 'w', **clipped_meta) as dst:
+                dst.write(clipped)
+        _os.remove(tmp_path)
+        print('WorldCover saved: ' + cache_path)
+    else:
+        print('WorldCover cache hit: ' + cache_path)
+
+    result = gpd.GeoDataFrame(
+        pd.DataFrame([{'tif_path': cache_path, 'source': 'esa_worldcover'}]),
+        geometry=gpd.points_from_xy([0], [0]), crs='EPSG:4326')
+    print('tif_path=' + cache_path)
+
+download_data()
+""".replace("__PLACE__", place).replace("__CITYSLUG__", city_slug),
     }
+
     return templates.get(source_type)
 
 
 # ── Disk persistence ──────────────────────────────────────────────────────────
-
-def save_to_disk(code: str, source_type: str, task: str) -> str | None:
-    task_hash = abs(hash(task)) % 1_000_000
-    save_path = f"/data/processed/{source_type}_{task_hash}.geojson"
-    os.makedirs("/data/processed", exist_ok=True)
-
-    save_code = code + f"""
-import os
-os.makedirs('/data/processed', exist_ok=True)
-
-out = result.reset_index(drop=True).copy()
-
-name_candidates = ['name', 'Name', 'NAME', 'ward', 'Ward', 'label',
-                   'title', 'ward_name', 'area_name', 'localname',
-                   'amenity', 'leisure', 'landuse', 'highway']
-keep_cols = ['geometry'] + [c for c in name_candidates if c in out.columns]
-out = out[keep_cols].copy()
-
-for col in keep_cols:
-    if col == 'geometry':
-        continue
-    try:
-        out[col] = out[col].astype(str).astype(object)
-    except Exception:
-        out = out.drop(columns=[col])
-
-out = out[out.geometry.notna() & out.geometry.is_valid].copy()
-out.to_file('{save_path}', driver='GeoJSON')
-print('SAVED_OK')
-"""
-    try:
-        save_timeout = 180 if "roads" in source_type else 90
-        proc = subprocess.run(
-            [sys.executable, "-c", save_code],
-            capture_output=True, text=True, timeout=save_timeout,
-        )
-        if proc.returncode == 0 and "SAVED_OK" in proc.stdout and os.path.exists(save_path):
-            return save_path
-        print(f"[Retrieval] save_to_disk failed for {source_type}:")
-        print(f"[Retrieval]   stdout: {proc.stdout.strip()[:200]}")
-        print(f"[Retrieval]   stderr: {proc.stderr.strip()[:300]}")
-    except subprocess.TimeoutExpired:
-        print(f"[Retrieval] save_to_disk timed out for {source_type}")
-    except Exception as e:
-        print(f"[Retrieval] save_to_disk exception for {source_type}: {e}")
-    return None
+# Saving now happens INSIDE the fetch sandbox run (run_code_in_sandbox save_path
+# parameter) — one download instead of three (fetch / bbox-check / save).
 
 
 # ── Source selection ──────────────────────────────────────────────────────────
@@ -1015,19 +1552,52 @@ Return only Python code."""
 
 # ── Sandbox execution ─────────────────────────────────────────────────────────
 
-def run_code_in_sandbox(code: str, timeout: int = 60) -> dict:
+def run_code_in_sandbox(code: str, timeout: int = 60, save_path: str = None) -> dict:
+    save_section = ""
+    if save_path:
+        save_section = f"""
+import os as _os_save
+_os_save.makedirs('/data/processed', exist_ok=True)
+out = result.reset_index(drop=True).copy()
+name_candidates = ['name', 'Name', 'NAME', 'ward', 'Ward', 'label',
+                   'title', 'ward_name', 'area_name', 'localname',
+                   'amenity', 'leisure', 'landuse', 'highway']
+keep_cols = ['geometry'] + [c for c in name_candidates if c in out.columns]
+out = out[keep_cols].copy()
+for col in keep_cols:
+    if col == 'geometry':
+        continue
+    try:
+        out[col] = out[col].astype(str).astype(object)
+    except Exception:
+        out = out.drop(columns=[col])
+out = out[out.geometry.notna() & out.geometry.is_valid].copy()
+out.to_file('{save_path}', driver='GeoJSON')
+print('SAVED_OK')
+"""
     wrapped = f"""
 import geopandas as gpd
 import pandas as pd
 import osmnx as ox
+ox.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
 import warnings
 warnings.filterwarnings('ignore')
 
+result = None
+
 {code}
 
+if result is None:
+    raise ValueError("result is None — download_data() never assigned a GeoDataFrame")
 print("ROWS:", len(result))
 print("CRS:", result.crs)
 print("COLUMNS:", list(result.columns))
+try:
+    _b = result.to_crs('EPSG:4326').total_bounds
+    print(f"BBOX: {{_b[1]:.4f}},{{_b[3]:.4f}},{{_b[0]:.4f}},{{_b[2]:.4f}}")
+except Exception:
+    print("BBOX: NA")
+{save_section}
 """
     try:
         proc = subprocess.run(
@@ -1052,17 +1622,24 @@ def validate_output(output: str) -> dict:
     return {"valid": True}
 
 
-def validate_city_bbox(code: str, city: str, output: str) -> dict:
+def validate_city_bbox(city: str, output: str) -> dict:
     """LLM-Find Feature #1: Type 2 error detection — checks if retrieved data
-    is actually in the right city by comparing bbox of results with city bbox.
-    Catches runnable-but-wrong data (e.g., London hospitals returned for Mumbai query)."""
+    is actually in the right city by comparing the BBOX line printed by the
+    sandbox against the city's Nominatim bbox. No re-execution of fetch code."""
     if not city or not output:
         return {"valid": True}
-    # Extract rows count — skip check for very small results
     import re
     rows_match = re.search(r"ROWS:\s*(\d+)", output)
     if not rows_match or int(rows_match.group(1)) < 2:
         return {"valid": True}
+    bbox_match = re.search(
+        r"BBOX: (-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)", output)
+    if not bbox_match:
+        return {"valid": True}
+    data_south = float(bbox_match.group(1))
+    data_north = float(bbox_match.group(2))
+    data_west = float(bbox_match.group(3))
+    data_east = float(bbox_match.group(4))
     try:
         import requests
         res = requests.get(
@@ -1085,28 +1662,6 @@ def validate_city_bbox(code: str, city: str, output: str) -> dict:
         city_north += lat_margin
         city_west -= lon_margin
         city_east += lon_margin
-        # Run a quick check on the saved file
-        import subprocess
-        import sys
-        check_code = f"""
-import geopandas as gpd, re
-{code}
-bounds = result.to_crs('EPSG:4326').total_bounds  # minx, miny, maxx, maxy
-print(f"BBOX: {{bounds[1]:.2f}},{{bounds[3]:.2f}},{{bounds[0]:.2f}},{{bounds[2]:.2f}}")
-"""
-        proc = subprocess.run([sys.executable, "-c", check_code],
-                              capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            return {"valid": True}  # Can't check, assume ok
-        bbox_match = re.search(
-            r"BBOX: ([\d.-]+),([\d.-]+),([\d.-]+),([\d.-]+)", proc.stdout)
-        if not bbox_match:
-            return {"valid": True}
-        data_south = float(bbox_match.group(1))
-        data_north = float(bbox_match.group(2))
-        data_west = float(bbox_match.group(3))
-        data_east = float(bbox_match.group(4))
-        # Check overlap
         lat_ok = data_south <= city_north and data_north >= city_south
         lon_ok = data_west <= city_east and data_east >= city_west
         if not lat_ok or not lon_ok:
@@ -1114,7 +1669,7 @@ print(f"BBOX: {{bounds[1]:.2f}},{{bounds[3]:.2f}},{{bounds[0]:.2f}},{{bounds[2]:
                 f"[Retrieval] Type 2 error: data bbox ({data_south:.1f},{data_north:.1f},{data_west:.1f},{data_east:.1f}) doesn't overlap {city} bbox ({city_south:.1f},{city_north:.1f},{city_west:.1f},{city_east:.1f})")
             return {"valid": False, "error": f"Retrieved data is not in {city} — data bbox doesn't overlap city bbox"}
         return {"valid": True}
-    except Exception as e:
+    except Exception:
         return {"valid": True}  # On any error, don't block
 
 
@@ -1135,8 +1690,42 @@ def fetch_data_for_task(task: str, city: str = "") -> dict:
                 continue
 
             print(f"[Retrieval] Fetching {source_type}...")
-            timeout = 180 if "roads" in source_type else 300 if source_type == "osm_boundaries" else 120
-            sandbox_result = run_code_in_sandbox(code, timeout=timeout)
+
+            # ── Persistent cache for boundaries (city-level, survives restarts) ──
+            # Implements LLM-dCache-style key-value caching (dataset:city slug).
+            # First fetch for any city takes 2-10 min; all subsequent are instant.
+            if source_type == "osm_boundaries":
+                import re as _re
+                _slug = _re.sub(r'[^a-z0-9]', '_', city.lower()).strip('_')
+                _cache_dir = "/data/cache"
+                _cache_path = f"{_cache_dir}/boundaries_{_slug}.geojson"
+                os.makedirs(_cache_dir, exist_ok=True)
+                if os.path.exists(_cache_path):
+                    print(
+                        f"[Retrieval] osm_boundaries cache HIT: {_cache_path}")
+                    results[source_type] = {
+                        "code": code, "output": "SAVED_OK",
+                        "attempts": 0, "file_path": _cache_path,
+                    }
+                    continue
+            if source_type.startswith("satellite_") or source_type == "worldpop_population":
+                timeout = 900
+            elif "roads" in source_type or source_type == "osm_boundaries":
+                timeout = 600
+            else:
+                timeout = 120
+            import hashlib as _hl
+            task_hash = int(_hl.md5(task.encode()).hexdigest()
+                            [:8], 16) % 1_000_000
+            save_path = f"/data/processed/{source_type}_{task_hash}.geojson"
+            sandbox_result = run_code_in_sandbox(
+                code, timeout=timeout, save_path=save_path)
+
+            if not sandbox_result["success"] and source_type == "osm_boundaries":
+                print(
+                    f"[Retrieval] Retrying osm_boundaries (first attempt failed)...")
+                sandbox_result = run_code_in_sandbox(
+                    code, timeout=timeout, save_path=save_path)
 
             if sandbox_result["success"]:
                 validation = validate_output(sandbox_result["output"])
@@ -1144,27 +1733,46 @@ def fetch_data_for_task(task: str, city: str = "") -> dict:
                     # LLM-Find Feature #1: Type 2 error detection
                     # Check if retrieved data is actually in the right city
                     bbox_check = validate_city_bbox(
-                        code, city, sandbox_result["output"])
+                        city, sandbox_result["output"])
                     if not bbox_check["valid"]:
                         print(
                             f"[Retrieval] {source_type} Type 2 error: {bbox_check['error'][:80]}")
+                        # Wrong-city data — remove the file saved in-run
+                        try:
+                            if os.path.exists(save_path):
+                                os.remove(save_path)
+                        except Exception:
+                            pass
                         results[source_type] = {
                             "error": bbox_check["error"], "attempts": 1, "file_path": None}
                         continue
-                    print(f"[Retrieval] {source_type} fetched")
-                    saved_path = save_to_disk(code, source_type, task)
+                    saved_path = save_path if (
+                        "SAVED_OK" in sandbox_result["output"] and os.path.exists(save_path)) else None
                     if saved_path:
                         print(
-                            f"[Retrieval] {source_type} saved to {saved_path}")
+                            f"[Retrieval] {source_type} fetched + saved to {saved_path}")
+                        # Write to persistent cache for future queries
+                        if source_type == "osm_boundaries" and saved_path:
+                            try:
+                                import re as _re
+                                import shutil as _sh
+                                _slug = _re.sub(
+                                    r'[^a-z0-9]', '_', city.lower()).strip('_')
+                                _cache_path = f"/data/cache/boundaries_{_slug}.geojson"
+                                os.makedirs("/data/cache", exist_ok=True)
+                                _sh.copy2(saved_path, _cache_path)
+                                print(
+                                    f"[Retrieval] osm_boundaries cached: {_cache_path}")
+                            except Exception as _ce:
+                                print(f"[Retrieval] cache write failed: {_ce}")
                     else:
                         print(
-                            f"[Retrieval] WARNING: {source_type} save failed — file_path will be None")
-                    # FIX 4: always include file_path key (None if save failed)
+                            f"[Retrieval] WARNING: {source_type} fetched but save failed — file_path will be None")
                     results[source_type] = {
                         "code":      code,
                         "output":    sandbox_result["output"],
                         "attempts":  1,
-                        "file_path": saved_path,  # None if save failed, not missing
+                        "file_path": saved_path,
                     }
                 else:
                     print(
@@ -1173,7 +1781,7 @@ def fetch_data_for_task(task: str, city: str = "") -> dict:
                         "error": validation["error"], "attempts": 1, "file_path": None}
             else:
                 print(
-                    f"[Retrieval] {source_type} fetch failed: {sandbox_result['error'][:100]}")
+                    f"[Retrieval] {source_type} fetch failed: ...{sandbox_result['error'][-300:]}")
                 results[source_type] = {
                     "error": sandbox_result["error"], "attempts": 1, "file_path": None}
 
@@ -1215,19 +1823,26 @@ def fetch_data_for_task(task: str, city: str = "") -> dict:
         attempt_history = []
         error = "No attempts made"
 
+        import hashlib as _hl2
+        _ss_hash = int(_hl2.md5(task.encode()).hexdigest()[:8], 16) % 1_000_000
+        _ss_path = f"/data/processed/{name}_{_ss_hash}.geojson"
         for attempt in range(3):
-            sandbox_result = run_code_in_sandbox(code, timeout=180)
+            sandbox_result = run_code_in_sandbox(
+                code, timeout=180, save_path=_ss_path)
 
             if sandbox_result["success"]:
                 validation = validate_output(sandbox_result["output"])
                 if validation["valid"]:
+                    _saved = _ss_path if (
+                        "SAVED_OK" in sandbox_result["output"] and os.path.exists(_ss_path)) else None
                     print(
-                        f"[Retrieval] {name} fetched on attempt {attempt + 1}")
+                        f"[Retrieval] {name} fetched on attempt {attempt + 1}"
+                        + (f", saved to {_saved}" if _saved else ", save failed — file_path None"))
                     results[name] = {
                         "code":     code,
                         "output":   sandbox_result["output"],
                         "attempts": attempt + 1,
-                        "file_path": None,  # FIX 4: always present
+                        "file_path": _saved,
                     }
                     break
                 error = validation["error"]

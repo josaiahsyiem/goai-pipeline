@@ -34,6 +34,37 @@ except Exception as e:
     print(f"[Startup] WorldPop pre-download failed to start: {e}")
 
 
+# Cleanup: remove processed result files older than 24h on worker startup,
+# so generated GeoJSON/PNG outputs don't accumulate indefinitely.
+def _cleanup_old_outputs(max_age_hours: int = 24):
+    import time
+    import glob
+    processed_dir = "/data/processed"
+    if not os.path.isdir(processed_dir):
+        return
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    for pattern in ("*.geojson", "*.png"):
+        for fp in glob.glob(os.path.join(processed_dir, pattern)):
+            try:
+                # Never delete cached WorldPop rasters (they're .tif anyway) or
+                # long-lived boundary caches that are expensive to rebuild.
+                if os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+                    removed += 1
+            except Exception:
+                continue
+    if removed:
+        print(
+            f"[Startup] Cleaned up {removed} old result files (>{max_age_hours}h)")
+
+
+try:
+    _cleanup_old_outputs()
+except Exception as e:
+    print(f"[Startup] Output cleanup failed: {e}")
+
+
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def get_conn():
@@ -49,90 +80,33 @@ def get_conn():
 # ── GeoJSON extraction ────────────────────────────────────────────────────────
 
 def extract_geojson(result: dict) -> str | None:
-    import subprocess
-    import sys
-
-    code = result.get("code", "")
-    if not code:
-        print("[Worker] No code in result — skipping GeoJSON extraction")
+    """Reads the RESULT_GEOJSON file written by the analysis sandbox.
+    No re-execution of analysis code."""
+    import re
+    output = result.get("output", "")
+    m = re.search(r"RESULT_GEOJSON:\s*(/\S+\.geojson)", output)
+    if not m:
+        print("[Worker] No RESULT_GEOJSON marker in output")
         return None
-
-    wrapped = """
-import geopandas as gpd
-import pandas as pd
-import osmnx as ox
-from shapely.validation import make_valid
-from shapely.geometry import Point
-import warnings
-import json
-import sys
-import os
-warnings.filterwarnings('ignore')
-
-try:
-    import rasterio
-    from rasterstats import zonal_stats
-except ImportError:
-    pass
-
-default_buffer = 100
-
-""" + code + """
-
-out = result.head(50).copy()
-
-for col in list(out.columns):
-    if col == 'geometry':
-        continue
+    path = m.group(1)
+    if not os.path.exists(path):
+        print(f"[Worker] Result file missing: {path}")
+        return None
     try:
-        out[col] = out[col].astype(str)
-    except Exception:
-        out = out.drop(columns=[col])
-
-out = out[out.geometry.notna() & out.geometry.is_valid].copy()
-
-if len(out) == 0:
-    sys.stdout.write("NO_FEATURES")
-else:
-    sys.stdout.write(out.to_json())
-sys.stdout.flush()
-"""
-
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", wrapped],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        print("[Worker] GeoJSON extraction timed out")
+        with open(path) as f:
+            parsed = json.load(f)
+    except Exception as e:
+        print(f"[Worker] GeoJSON read error: {e}")
         return None
-
-    if proc.returncode != 0:
-        print(f"[Worker] GeoJSON sandbox error: {proc.stderr[:300]}")
+    feats = parsed.get("features") or []
+    if not feats:
+        print("[Worker] GeoJSON: empty features")
         return None
-
-    lines = [l for l in proc.stdout.strip().split('\n') if l.strip()]
-    stdout = lines[-1] if lines else ""
-
-    if not stdout or stdout == "NO_FEATURES":
-        print("[Worker] GeoJSON: no features produced")
-        return None
-
-    try:
-        parsed = json.loads(stdout)
-    except json.JSONDecodeError as e:
-        print(f"[Worker] GeoJSON parse error: {e}")
-        print(f"[Worker] stdout sample: {stdout[:200]}")
-        return None
-
-    if "features" not in parsed or not parsed["features"]:
-        print("[Worker] GeoJSON: missing or empty features")
-        return None
-
+    if len(feats) > 1000:
+        parsed["features"] = feats[:1000]
+        print(f"[Worker] GeoJSON capped 1000/{len(feats)}")
     print(f"[Worker] GeoJSON: {len(parsed['features'])} features extracted")
-    return stdout
+    return json.dumps(parsed)
 
 
 # ── Task handler ──────────────────────────────────────────────────────────────
@@ -144,6 +118,7 @@ def process_task(
     city: str = "",
     upload_paths: list = None,
     domain_hint: str = None,
+    session_id: str = None,
 ):
     conn = get_conn()
     cur = conn.cursor()
@@ -159,6 +134,7 @@ def process_task(
             task_id=task_id,
             upload_paths=upload_paths,
             domain_hint=domain_hint,
+            session_id=session_id or task_id,
         )
 
         if result["success"]:
@@ -197,6 +173,10 @@ def process_task(
 
     except Exception as e:
         print(f"[Worker] Unhandled error for task {task_id}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         cur.execute(
             "UPDATE tasks SET status=%s, result=%s WHERE id=%s",
             ("failed", json.dumps({"error": str(e)}), task_id),

@@ -199,8 +199,7 @@ COMBINED_KW = [
 ]
 
 PROXIMITY_KW = [
-    "within", "near", "closest", "nearest", "km of", "miles of",
-    "radius", "distance from", "close to", "around"
+    "nearest", "closest", "km of", "miles of", "radius", "distance from"
 ]
 
 
@@ -235,7 +234,8 @@ def parse_query(task):
     else:
         composite_pattern = None
 
-    if any(k in t for k in PROXIMITY_KW):
+    if composite_pattern is None and (any(k in t for k in PROXIMITY_KW)
+                                      or re.search(r'within\s+\d', t)):
         mode = "proximity"
     elif any(k in t for k in PER_CAPITA_KW):
         mode = "percapita"
@@ -247,9 +247,11 @@ def parse_query(task):
     else:
         mode = "raw"
 
-    # longest stem first
+    # longest stem first, word-boundary matched (parking != park)
+    _prefix_stems = {"pharmac", "librar", "veterinar"}
     for stem in sorted(FEATURE_TAGS.keys(), key=len, reverse=True):
-        if stem in t:
+        _tail = '' if stem in _prefix_stems else r'(?:s|es)?\b'
+        if re.search(r'\b' + re.escape(stem) + _tail, t):
             tags, kind = FEATURE_TAGS[stem]
             label = stem.replace(" ", "_")
             return tags, kind, mode, ascending, label, composite_pattern
@@ -257,10 +259,75 @@ def parse_query(task):
     return None, None, mode, ascending, None, composite_pattern
 
 
-def llm_resolve_feature(task):
+def _get_tag_prevalence(place, osm_key="amenity", sample=200):
+    """
+    Sample real OSM tag values for a place via Overpass.
+    Returns a string like: "amenity: hospital 34%, clinic 28%, doctors 18%..."
+    Used to ground llm_resolve_feature in actual OSM data for the city.
+    """
+    try:
+        import requests as _req
+        from collections import Counter
+        # Get bbox from Nominatim
+        nom = _req.get(
+            'https://nominatim.openstreetmap.org/search',
+            params={'q': place, 'format': 'json',
+                    'limit': 1, 'accept-language': 'en'},
+            headers={'User-Agent': 'GoAI/1.0'}, timeout=10).json()
+        if not nom:
+            return ""
+        bb = nom[0]['boundingbox']
+        s, w, n, e = float(bb[0]), float(bb[2]), float(bb[1]), float(bb[3])
+        # Cap oversized bboxes using Nominatim lat/lon as true center
+        # (cities with outlying territory return huge bboxes otherwise)
+        cy, cx = float(nom[0]['lat']), float(nom[0]['lon'])
+        _ms = 1.5
+        if (n - s) > _ms or (e - w) > _ms:
+            s, n = cy - _ms / 2, cy + _ms / 2
+            w, e = cx - _ms / 2, cx + _ms / 2
+        bbox = '%s,%s,%s,%s' % (s, w, n, e)
+        query = '[out:json][timeout:30];node["%s"](%s);out %d;' % (
+            osm_key, bbox, sample)
+        import time as _t
+        _eps = ['http://overpass-api.de/api/interpreter',
+                'http://overpass.kumi.systems/api/interpreter']
+        for _attempt in range(3):
+            for ep in _eps:
+                try:
+                    resp = _req.post(ep, data={'data': query},
+                                     headers={'User-Agent': 'GoAI/1.0'}, timeout=45)
+                    elements = resp.json().get('elements', [])
+                    if elements:
+                        counts = Counter(
+                            el.get('tags', {}).get(osm_key, '')
+                            for el in elements
+                            if el.get('tags', {}).get(osm_key)
+                        )
+                        total = sum(counts.values()) or 1
+                        top = counts.most_common(8)
+                        hint = ', '.join(
+                            '%s %.0f%%' % (v, 100 * c / total) for v, c in top
+                        )
+                        result = '%s: %s' % (osm_key, hint)
+                        print('[Generic] tag prevalence for %s — %s' %
+                              (place, result))
+                        return result
+                except Exception:
+                    continue
+            _t.sleep(2)
+    except Exception as ex:
+        print('[Generic] tag prevalence fetch failed: %s' % ex)
+    return ""
+
+
+def llm_resolve_feature(task, prevalence_hint=""):
+    hint_block = (
+        '\n\nReal OSM tag distribution in this city (use this to pick the right values):\n%s'
+        % prevalence_hint
+    ) if prevalence_hint else ""
     prompt = (
         'Translate this geographic question into OpenStreetMap query parameters.\n'
-        f'Question: "{task}"\n\n'
+        f'Question: "{task}"{hint_block}\n\n'
         'Return ONLY a JSON object, no prose:\n'
         '{"tags": {"<osm_key>": ["<value>", ...]}, "kind": "point|area|line", "label": "<short noun>"}\n'
         'Rules: kind=point for things you count; kind=area for polygons; kind=line for linear features.\n'
@@ -302,7 +369,8 @@ import warnings; warnings.filterwarnings('ignore')
 def go():
     global result
     res = requests.get('https://nominatim.openstreetmap.org/search',
-                       params={'q': '__PLACE__', 'format': 'json', 'limit': 1},
+                       params={'q': '__PLACE__', 'format': 'json', 'limit': 1,
+                               'accept-language': 'en'},
                        headers={'User-Agent': 'GoAI/1.0'}, timeout=20)
     data = res.json()
     if not data:
@@ -313,12 +381,15 @@ def go():
     zone = int((cx + 180) / 6) + 1
     utm = 'EPSG:%d' % (32600 + zone if cy >= 0 else 32700 + zone)
     best = None
-    for lvl in ['10', '9', '8', '7', '6']:
+    best_score = 0
+    for lvl in ['7', '8', '9', '10', '6', '5']:
         try:
-            cand = _ffb(north, south, east, west, {'boundary': 'administrative', 'admin_level': lvl}).reset_index(drop=True)
+            cand = _ffb(north, south, east, west,
+                        {'boundary': 'administrative', 'admin_level': lvl}).reset_index(drop=True)
             if 'boundary' in cand.columns:
                 cand = cand[cand['boundary'] == 'administrative'].copy()
-            cand = cand[cand.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])].copy()
+            cand = cand[cand.geometry.geom_type.isin(
+                ['Polygon', 'MultiPolygon'])].copy()
             for col in ['leisure', 'landuse', 'natural']:
                 if col in cand.columns:
                     cand = cand[cand[col].isna()].copy()
@@ -329,19 +400,107 @@ def go():
                 continue
             cand['geometry'] = cand['geometry'].apply(make_valid)
             cu = cand.to_crs(utm)
-            med = cu.geometry.area.median()
-            cand = cand[cu.geometry.area.values >= med * 0.1].copy().reset_index(drop=True)
-            if len(cand) >= 3:
+            areas = cu.geometry.area / 1e6
+            med = areas.median()
+            # Keep units between 1% and 2000% of median — removes both
+            # sub-unit noise AND giant state-level boundaries
+            cand = cand[(areas.values >= med * 0.1) &
+                        (areas.values <= med * 20)].copy().reset_index(drop=True)
+            if len(cand) < 3:
+                continue
+            # Score = count of units in the "ward-like" size range (0.5–500 km²)
+            cu2 = cand.to_crs(utm)
+            ward_like = ((cu2.geometry.area / 1e6) >= 0.5) & \
+                        ((cu2.geometry.area / 1e6) <= 500)
+            score = ward_like.sum()
+            print('boundaries admin_level=%s n=%d score=%d' %
+                  (lvl, len(cand), score))
+            if score > best_score:
+                best_score = score
                 best = cand
-                print('boundaries admin_level=%s n=%d' % (lvl, len(best)))
-                break
         except Exception as e:
             print('boundary level %s failed: %s' % (lvl, e))
             continue
+    if best is not None:
+        print('best admin level: n=%d' % len(best))
     if best is None or len(best) < 3:
-        best = ox.geocode_to_gdf('__PLACE__').reset_index(drop=True)
-        print('boundaries fallback to city outline')
+        print('too few after clip — trying bbox-only fallback')
+        best = None
+        best_score = 0
+        for lvl2 in ['7', '8', '9', '10', '6', '5']:
+            try:
+                tags2 = {'boundary': 'administrative', 'admin_level': lvl2}
+                cand2 = _ffb(north, south, east, west, tags2).reset_index(drop=True)
+                if 'boundary' in cand2.columns:
+                    cand2 = cand2[cand2['boundary'] == 'administrative'].copy()
+                cand2 = cand2[cand2.geometry.geom_type.isin(
+                    ['Polygon', 'MultiPolygon'])].copy()
+                if 'name' in cand2.columns:
+                    cand2 = cand2[cand2['name'].notna()].copy()
+                cand2['geometry'] = cand2['geometry'].apply(make_valid)
+                cu2 = cand2.to_crs(utm)
+                areas2 = cu2.geometry.area / 1e6
+                med2 = areas2.median()
+                cand2 = cand2[(areas2 >= med2 * 0.1) &
+                              (areas2 <= med2 * 20)].copy().reset_index(drop=True)
+                if len(cand2) < 3:
+                    continue
+                areas2 = (cand2.to_crs(utm).geometry.area / 1e6)
+                score2 = int(((areas2 >= 0.5) & (areas2 <= 500)).sum())
+                print('bbox-only level=%s n=%d score=%d' % (lvl2, len(cand2), score2))
+                if score2 > best_score:
+                    best_score = score2
+                    best = cand2
+            except Exception as _e3:
+                continue
+    if best is None or len(best) < 3:
+        raise ValueError('no usable admin boundaries for __PLACE__')
     best['geometry'] = best['geometry'].apply(make_valid)
+    from shapely.geometry import shape as _shape, box as _bb
+    city_poly = None
+    g = data[0].get('geojson')
+    if g and g.get('type') in ('Polygon', 'MultiPolygon'):
+        city_poly = make_valid(_shape(g)); print('city polygon: nominatim')
+    if city_poly is None:
+        try:
+            _g0 = make_valid(ox.geocode_to_gdf('__PLACE__').geometry.iloc[0])
+            if _g0.geom_type in ('Polygon', 'MultiPolygon'):
+                city_poly = _g0; print('city polygon: geocode_to_gdf')
+        except Exception as _e2:
+            print('geocode polygon failed: %s' % _e2)
+    if city_poly is None:
+        city_poly = _bb(west, south, east, north); print('city polygon: bbox')
+    keep = best.geometry.centroid.within(city_poly)
+    best = best[keep.values].copy().reset_index(drop=True)
+    if len(best):
+        bu = best.to_crs(utm)
+        med2 = (bu.geometry.area / 1e6).median()
+        best = best[(bu.geometry.area / 1e6).values <= med2 * 8].copy().reset_index(drop=True)
+    if 'name' in best.columns:
+        cn = '__PLACE__'.split(',')[0].strip().lower()
+        best = best[best['name'].str.lower().str.strip() != cn].copy().reset_index(drop=True)
+    if len(best) < 3:
+        print('too few after clip — bbox-only tier')
+        _b2 = None; _bs2 = 0
+        for _lv in ['7','8','9','10','6','5']:
+            try:
+                _t2 = {'boundary':'administrative','admin_level':_lv}
+                _c2 = _ffb(north,south,east,west,_t2).reset_index(drop=True)
+                if 'boundary' in _c2.columns: _c2=_c2[_c2['boundary']=='administrative'].copy()
+                _c2=_c2[_c2.geometry.geom_type.isin(['Polygon','MultiPolygon'])].copy()
+                if 'name' in _c2.columns: _c2=_c2[_c2['name'].notna()].copy()
+                _c2['geometry']=_c2['geometry'].apply(make_valid)
+                _cu2=_c2.to_crs(utm); _ar2=_cu2.geometry.area/1e6; _med2=_ar2.median()
+                _c2=_c2[(_ar2>=_med2*0.1)&(_ar2<=_med2*20)].copy().reset_index(drop=True)
+                if len(_c2)<3: continue
+                _sc2=int(((_c2.to_crs(utm).geometry.area/1e6>=0.5)&(_c2.to_crs(utm).geometry.area/1e6<=500)).sum())
+                if _sc2>_bs2: _bs2=_sc2; _b2=_c2
+            except Exception: continue
+        if _b2 is not None and len(_b2)>=3:
+            best=_b2; print('bbox fallback success: %d units'%len(best))
+        else:
+            raise ValueError('no usable admin boundaries for __PLACE__ after all tiers')
+    print('boundaries after clip: %d' % len(best))
     result = best.to_crs('EPSG:4326')
 
 go()
@@ -352,7 +511,7 @@ go()
 # → no StringDtype issues. Two endpoint fallbacks for reliability.
 FEATURE_FETCH = '''
 import requests, geopandas as gpd
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon, LineString
 from shapely.validation import make_valid
 
 def _tags_to_overpass(tags):
@@ -371,58 +530,88 @@ def _tags_to_overpass(tags):
 def go():
     global result
     tags = __TAGS__
+    KIND = '__KIND__'
     tag_str = _tags_to_overpass(tags)
 
     # Get bounding box from Nominatim
     nom = requests.get('https://nominatim.openstreetmap.org/search',
-                       params={'q': '__PLACE__', 'format': 'json', 'limit': 1},
+                       params={'q': '__PLACE__', 'format': 'json', 'limit': 1,
+                               'accept-language': 'en'},
                        headers={'User-Agent': 'GoAI/1.0'}, timeout=20).json()
     if not nom:
         raise ValueError('Nominatim: no result for __PLACE__')
     bb = nom[0]['boundingbox']
     # Overpass bbox order: south, west, north, east
-    s, w, n, e = bb[0], bb[2], bb[1], bb[3]
+    s, w, n, e = float(bb[0]), float(bb[2]), float(bb[1]), float(bb[3])
+    cy, cx = float(nom[0]['lat']), float(nom[0]['lon'])
+    _ms = 1.5
+    if (n - s) > _ms or (e - w) > _ms:
+        s, n = cy - _ms/2, cy + _ms/2
+        w, e = cx - _ms/2, cx + _ms/2
 
     # Build Overpass QL query — nodes + ways (with center point for ways)
-    query = (
-        '[out:json][timeout:90];'
-        '(node%(t)s(%(s)s,%(w)s,%(n)s,%(e)s);'
-        'way%(t)s(%(s)s,%(w)s,%(n)s,%(e)s););'
-        'out center;'
-    ) % {'t': tag_str, 's': s, 'w': w, 'n': n, 'e': e}
+    bbox = '%s,%s,%s,%s' % (s, w, n, e)
+    node_part = 'node%s(%s);' % (tag_str, bbox) if KIND == 'point' else ''
+    out_mode = 'center' if KIND == 'point' else 'geom'
+    query = ('[out:json][timeout:90];(%sway%s(%s););out %s;'
+             % (node_part, tag_str, bbox, out_mode))
 
     data = None
-    for ep in [
-        'https://overpass-api.de/api/interpreter',
-        'https://overpass.kumi.systems/api/interpreter',
-    ]:
-        try:
-            resp = requests.post(ep, data={'data': query},
-                                 headers={'User-Agent': 'GoAI/1.0'}, timeout=120)
-            d = resp.json()
-            if d.get('elements'):
-                data = d
-                print('Overpass fetch from %s' % ep)
-                break
-        except Exception as ep_err:
-            print('Overpass %s failed: %s' % (ep, ep_err))
+    import time as _t
+    _eps = ['http://overpass-api.de/api/interpreter',
+            'http://overpass.kumi.systems/api/interpreter']
+    for _attempt in range(3):
+        for ep in _eps:
+            try:
+                resp = requests.post(ep, data={'data': query},
+                                     headers={'User-Agent': 'GoAI/1.0'}, timeout=120)
+                d = resp.json()
+                if d.get('elements'):
+                    data = d
+                    print('Overpass fetch from %s (attempt %d)' % (ep, _attempt + 1))
+                    break
+            except Exception as ep_err:
+                print('Overpass %s failed (attempt %d): %s' % (ep, _attempt + 1, ep_err))
+        if data:
+            break
+        _t.sleep(2)
 
     if not data or not data.get('elements'):
         raise ValueError('Overpass: no features found for __PLACE__')
 
     rows = []
     for el in data['elements']:
-        if el['type'] == 'node':
-            lat, lon = el.get('lat'), el.get('lon')
-        elif 'center' in el:
-            lat, lon = el['center']['lat'], el['center']['lon']
+        geom = None
+        if KIND == 'point':
+            if el['type'] == 'node':
+                lat, lon = el.get('lat'), el.get('lon')
+            elif 'center' in el:
+                lat, lon = el['center']['lat'], el['center']['lon']
+            else:
+                continue
+            if lat is None or lon is None:
+                continue
+            geom = Point(float(lon), float(lat))
         else:
-            continue
-        if lat is None or lon is None:
+            if el.get('type') != 'way' or 'geometry' not in el:
+                continue
+            coords = [(p['lon'], p['lat']) for p in el['geometry']]
+            if KIND == 'area':
+                if len(coords) >= 3:
+                    if coords[0] != coords[-1]:
+                        coords.append(coords[0])
+                    if len(coords) >= 4:
+                        try: geom = Polygon(coords)
+                        except Exception: geom = None
+            else:
+                if len(coords) >= 2:
+                    try: geom = LineString(coords)
+                    except Exception: geom = None
+        if geom is None:
             continue
         t = el.get('tags', {})
         rows.append({
-            'geometry': Point(float(lon), float(lat)),
+            'geometry': geom,
             'name':    str(t.get('name', '')),
             'amenity': str(t.get('amenity', '')),
             'shop':    str(t.get('shop', '')),
@@ -470,7 +659,11 @@ def go():
     cx = float(nom[0]['lon'])
     cy = float(nom[0]['lat'])
     bb = nom[0]['boundingbox']
-    s, w, n, e = bb[0], bb[2], bb[1], bb[3]
+    s, w, n, e = float(bb[0]), float(bb[2]), float(bb[1]), float(bb[3])
+    _ms = 1.5
+    if (n - s) > _ms or (e - w) > _ms:
+        s, n = cy - _ms/2, cy + _ms/2
+        w, e = cx - _ms/2, cx + _ms/2
     query = (
         '[out:json][timeout:90];'
         '(node%(t)s(%(s)s,%(w)s,%(n)s,%(e)s);'
@@ -478,16 +671,23 @@ def go():
         'out center;'
     ) % {'t': tag_str, 's': s, 'w': w, 'n': n, 'e': e}
     data = None
-    for ep in ['https://overpass-api.de/api/interpreter',
-               'https://overpass.kumi.systems/api/interpreter']:
-        try:
-            resp = requests.post(ep, data={'data': query},
-                                 headers={'User-Agent': 'GoAI/1.0'}, timeout=120)
-            d = resp.json()
-            if d.get('elements'):
-                data = d; break
-        except Exception as ep_err:
-            print('Overpass %s failed: %s' % (ep, ep_err))
+    import time as _t
+    _eps = ['http://overpass-api.de/api/interpreter',
+            'http://overpass.kumi.systems/api/interpreter']
+    for _attempt in range(3):
+        for ep in _eps:
+            try:
+                resp = requests.post(ep, data={'data': query},
+                                     headers={'User-Agent': 'GoAI/1.0'}, timeout=120)
+                d = resp.json()
+                if d.get('elements'):
+                    data = d
+                    break
+            except Exception as ep_err:
+                print('Overpass %s failed (attempt %d): %s' % (ep, _attempt + 1, ep_err))
+        if data:
+            break
+        _t.sleep(2)
     if not data or not data.get('elements'):
         raise ValueError('Overpass: no features found for __PLACE__')
     rows = []
@@ -716,7 +916,7 @@ def run_proximity():
     within['rank'] = range(1, len(within) + 1)
     keep = [c for c in ['rank', 'name', 'distance_km', 'amenity', 'geometry'] if c in within.columns]
     result = within[keep].to_crs(WGS84).reset_index(drop=True)
-    print('PROXIMITY: %d %s within %dkm of %s' % (len(result), LABEL, RADIUS_KM, CITY))
+    print('PROXIMITY: %d %s within %.1fkm %s' % (len(result), LABEL, RADIUS_KM, CITY))
     for _, row in result.head(20).iterrows():
         print('#%d %s: %.2fkm' % (int(row['rank']), str(row['name']), float(row['distance_km'])))
 
@@ -858,6 +1058,24 @@ run_composite()
 '''
 
 
+GENERIC_EXPORT = '''
+print('ROWS:', len(result))
+try:
+    import os as _eo, time as _et
+    _gp = '/data/processed/result_%d_%d.geojson' % (_eo.getpid(), int(_et.time()*1000) % 100000)
+    _ex = result.to_crs('EPSG:4326').copy()
+    _ex['geometry'] = _ex.geometry.simplify(0.0001, preserve_topology=True)
+    for _c in list(_ex.columns):
+        if _c != 'geometry' and str(_ex[_c].dtype) == 'object':
+            _ex[_c] = _ex[_c].astype(str)
+    _ex = _ex[_ex.geometry.notna() & _ex.geometry.is_valid]
+    _ex.to_file(_gp, driver='GeoJSON')
+    print('RESULT_GEOJSON: %s' % _gp)
+except Exception as _ge:
+    print('RESULT_GEOJSON: NA (%s)' % _ge)
+'''
+
+
 def _run(code, timeout):
     try:
         p = subprocess.run([sys.executable, "-c", code],
@@ -879,7 +1097,14 @@ def _fetch_to_file(code, out_path, timeout):
 
 def _ensure_worldpop(city):
     import requests
-    iso = CITY_ISO3.get(city.lower().split(",")[0].strip(), "IND")
+    _cl = city.lower().split(",")[0].strip()
+    iso = CITY_ISO3.get(_cl)
+    if iso is None:
+        try:
+            from agents.analysis_agent import _resolve_iso3
+            iso = _resolve_iso3(_cl)
+        except Exception:
+            iso = "IND"
     try:
         os.makedirs(PROCESSED, exist_ok=True)
         data = requests.get(
@@ -898,8 +1123,14 @@ def _ensure_worldpop(city):
             import rasterio
             with rasterio.open(tif) as src:
                 epsg = src.crs.to_epsg() or 4326
-        except Exception:
-            pass
+                _ = src.read(1, window=rasterio.windows.Window(0, 0, 5, 5))
+        except Exception as _ce:
+            print("[Generic] WorldPop raster corrupt (%s) — removing" % _ce)
+            try:
+                os.remove(tif)
+            except Exception:
+                pass
+            return "", 4326
         return tif, epsg
     except Exception as e:
         print("[Generic] WorldPop failed: %s" % e)
@@ -959,8 +1190,6 @@ def _extract_second_feature(task):
             return tags, kind, label
     return None, None, None
 
-# ── Public entry point ───────────────────────────────────────────────────────
-
 
 # ── Public entry point ───────────────────────────────────────────────────────
 
@@ -970,25 +1199,51 @@ def run_generic_analysis(task, plan, retrieved_data):
         return {"success": False, "error": "Generic engine needs a city"}
 
     tags, kind, mode, ascending, label, composite_pattern = parse_query(task)
+    _hc = plan.get("_hint_config", {}) if isinstance(plan, dict) else {}
+    if "ascending" in _hc:
+        ascending = _hc["ascending"]
+        print("[Generic] ascending=%s (hint override)" % ascending)
+    if _hc.get("road_types") and label in ("road", "street"):
+        tags = {"highway": list(_hc["road_types"])}
+        print("[Generic] road_types from hint: %s" % tags)
     if tags is None:
-        tags, kind, label = llm_resolve_feature(task)
+        # Get real OSM tag distribution for this city before asking the LLM.
+        # Grounds tag selection in actual data — fixes "doctors" ambiguity etc.
+        prevalence_hint = _get_tag_prevalence(place, osm_key="amenity")
+        tags, kind, label = llm_resolve_feature(
+            task, prevalence_hint=prevalence_hint)
         if tags is None:
             return {"success": False, "error": "Could not map query to an OSM feature"}
 
     place = _place(city)
-    h = abs(hash(task + city)) % 1_000_000
+    import hashlib as _hl
+    h = int(_hl.md5((task + city).encode()).hexdigest()[:8], 16) % 1_000_000
 
-    # 1) boundaries
+    # 1) boundaries — priority: uploaded > retrieved > Mumbai local > fetch
     b_path = None
-    rb = (retrieved_data or {}).get("osm_boundaries", {})
-    if isinstance(rb, dict):
-        rp = rb.get("file_path")
-        if rp and os.path.exists(rp):
-            b_path = rp
+    for f in (plan.get("upload_files") or []):
+        fp = f.get("file_path", "")
+        if f.get("type") == "geojson" and fp and os.path.exists(fp):
+            try:
+                import geopandas as _g
+                _df = _g.read_file(fp)
+                if len(_df) >= 3 and _df.geometry.geom_type.isin(
+                        ['Polygon', 'MultiPolygon']).mean() >= 0.5:
+                    b_path = fp
+                    print("[Generic] using UPLOADED boundaries: %s" % fp)
+                    break
+            except Exception:
+                continue
     if b_path is None and "mumbai" in city.lower():
         mw = "/data/mumbai_ward_shapefile/Mumbai_wards.geojson"
         if os.path.exists(mw):
             b_path = mw
+            print("[Generic] Mumbai — using BMC Mumbai_wards.geojson")
+    rb = (retrieved_data or {}).get("osm_boundaries", {})
+    if b_path is None and isinstance(rb, dict):
+        rp = rb.get("file_path")
+        if rp and os.path.exists(rp):
+            b_path = rp
     if b_path is None:
         print("[Generic] fetching boundaries for %s" % place)
         b_path = _fetch_to_file(
@@ -1004,25 +1259,52 @@ def run_generic_analysis(task, plan, retrieved_data):
     fetch_template = PROXIMITY_FETCH if mode == "proximity" else FEATURE_FETCH
     f_path = _fetch_to_file(
         fetch_template.replace("__PLACE__", place).replace(
-            "__TAGS__", repr(tags)),
+            "__TAGS__", repr(tags)).replace("__KIND__", kind or "point"),
         "%s/generic_feat_%d.geojson" % (PROCESSED, h), 180)
     if f_path is None:
+        # Dead-end retry: broaden tags and try once more before giving up.
         nice = label.replace("_", " ")
-        return {"success": False,
-                "error": "No %s found in %s (no matching OpenStreetMap data)" % (nice, city),
-                "no_data": True}
+        print("[Generic] No %s found — attempting broadened tag retry" % nice)
+        prevalence_hint = _get_tag_prevalence(place, osm_key="amenity")
+        retry_prompt = (
+            'The initial OSM query for "%s" in %s returned zero results. '
+            'Suggest broader/alternative OSM tags that might capture the same concept. '
+            '%s Return only JSON: {"tags": {...}, "kind": "point|area|line", "label": "..."}'
+            % (nice, city, ('Real tag distribution: ' + prevalence_hint + '.') if prevalence_hint else '')
+        )
+        r_tags, r_kind, r_label = llm_resolve_feature(
+            retry_prompt, prevalence_hint=prevalence_hint)
+        if r_tags and r_tags != tags:
+            print("[Generic] retry tags: %s" % r_tags)
+            f_path = _fetch_to_file(
+                (PROXIMITY_FETCH if mode == "proximity" else FEATURE_FETCH)
+                .replace("__PLACE__", place)
+                .replace("__TAGS__", repr(r_tags))
+                .replace("__KIND__", r_kind or "point"),
+                "%s/generic_feat_retry_%d.geojson" % (PROCESSED, h), 180)
+            if f_path:
+                tags, kind, label = r_tags, r_kind, r_label
+                print("[Generic] retry succeeded with broadened tags")
+        if f_path is None:
+            return {"success": False,
+                    "error": "No %s found in %s (no matching OpenStreetMap data)" % (nice, city),
+                    "no_data": True}
 
     # 2b) proximity mode — different analysis path
     if mode == "proximity":
         import re as _re
-        radius_match = _re.search(r'(\d+)\s*km', task.lower())
-        radius_km = int(radius_match.group(1)) if radius_match else 5
+        _rm = _re.search(r'(\d+(?:\.\d+)?)\s*(km|m)\b', task.lower())
+        if _rm:
+            radius_km = float(_rm.group(1)) / \
+                (1000.0 if _rm.group(2) == 'm' else 1.0)
+        else:
+            radius_km = 5
         prox_code = (PROXIMITY_ANALYSIS_TEMPLATE
                      .replace("__F_PATH__", f_path)
                      .replace("__RADIUS_KM__", str(radius_km))
                      .replace("__LABEL__", label)
                      .replace("__CITY__", city))
-        rc, out, err = _run(prox_code + "\nprint('ROWS:', len(result))\n", 300)
+        rc, out, err = _run(prox_code + GENERIC_EXPORT, 300)
         if rc != 0:
             return {"success": False, "error": "Proximity analysis failed: %s" % err[-200:]}
         m = re.search(r"ROWS:\s*(\d+)", out)
@@ -1037,13 +1319,8 @@ def run_generic_analysis(task, plan, retrieved_data):
         print("[Generic] composite pattern=%s for %s" %
               (composite_pattern, place))
 
-        # Fetch feature A
-        fa_path = _fetch_to_file(
-            FEATURE_FETCH.replace("__PLACE__", place).replace(
-                "__TAGS__", repr(tags)),
-            "%s/generic_feat_a_%d.geojson" % (PROCESSED, h), 180)
-        if fa_path is None:
-            return {"success": False, "error": "Could not fetch %s for composite analysis" % label}
+        # Feature A already fetched as f_path — reuse, no duplicate Overpass call
+        fa_path = f_path
 
         # Fetch feature B if contrast/combined
         fb_path = ""
@@ -1053,7 +1330,7 @@ def run_generic_analysis(task, plan, retrieved_data):
             if tags_b:
                 fb_path = _fetch_to_file(
                     FEATURE_FETCH.replace("__PLACE__", place).replace(
-                        "__TAGS__", repr(tags_b)),
+                        "__TAGS__", repr(tags_b)).replace("__KIND__", kind_b or "point"),
                     "%s/generic_feat_b_%d.geojson" % (PROCESSED, h), 180)
 
         # Population raster
@@ -1062,6 +1339,8 @@ def run_generic_analysis(task, plan, retrieved_data):
 
         # Build composite code
         utm = _utm_for_file(b_path)
+        if _hc.get("epsg"):
+            utm = "EPSG:%s" % _hc["epsg"]
         code = (COMPOSITE_ANALYSIS_TEMPLATE
                 .replace("__B_PATH__", b_path)
                 .replace("__FA_PATH__", fa_path)
@@ -1073,7 +1352,7 @@ def run_generic_analysis(task, plan, retrieved_data):
                 .replace("__LABEL_B__", label_b or "feature_b")
                 .replace("__CITY__", city.replace('"', '')))
 
-        rc, out, err = _run(code + "\nprint('ROWS:', len(result))\n", 600)
+        rc, out, err = _run(code + GENERIC_EXPORT, 600)
         if rc != 0:
             return {"success": False, "error": "Composite analysis failed: %s" % err[-200:]}
         m = re.search(r"ROWS:\s*(\d+)", out)
@@ -1094,11 +1373,13 @@ def run_generic_analysis(task, plan, retrieved_data):
 
     # 4) build + run analysis (includes cross-validation)
     utm = _utm_for_file(b_path)
+    if _hc.get("epsg"):
+        utm = "EPSG:%s" % _hc["epsg"]
     code, metric = _build_analysis_code(
         b_path, f_path, kind, mode, ascending, label, city, pop_tif, raster_epsg)
     code = code.replace('UTM = "EPSG:32643"', 'UTM = "%s"' % utm)
 
-    rc, out, err = _run(code + "\nprint('ROWS:', len(result))\n", 600)
+    rc, out, err = _run(code + GENERIC_EXPORT, 600)
     if rc != 0:
         return {"success": False, "error": "Generic analysis failed: %s" % err.strip()[-300:]}
     m = re.search(r"ROWS:\s*(\d+)", out)

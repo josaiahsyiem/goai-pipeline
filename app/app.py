@@ -8,6 +8,7 @@ GeoJSON map data, Prometheus metrics, and health checks.
 
 import json
 import os
+import re
 import shutil
 import uuid
 from typing import Optional
@@ -111,6 +112,90 @@ class QueryRequest(BaseModel):
     upload_id:    Optional[str] = None
     session_id:   Optional[str] = None
     domain_hint:  Optional[str] = None
+
+
+# ── Multi-city comparison detection ──────────────────────────────────────────
+
+# Patterns we detect (case-insensitive):
+#   "hospitals per ward in Mumbai vs Berlin"
+#   "compare flood risk in Paris and Tokyo"
+#   "greenspace in London versus New York"
+#   "flood risk between Chennai and Pune"
+_VS_PATTERNS = [
+    # "X vs Y" or "X versus Y" with cities anywhere in query
+    re.compile(
+        r'\bin\s+([A-Za-z\s]+?)\s+(?:vs\.?|versus)\s+([A-Za-z\s]+?)(?:\s*$|\s+(?:for|by|per|with|using))',
+        re.IGNORECASE
+    ),
+    re.compile(
+        r'([A-Za-z\s]+?)\s+(?:vs\.?|versus)\s+([A-Za-z\s]+?)(?:\s*$|\s+(?:for|by|per|with|using|in))',
+        re.IGNORECASE
+    ),
+    # "compare X and Y" or "between X and Y"
+    re.compile(
+        r'(?:compare|between)\s+([A-Za-z\s]+?)\s+and\s+([A-Za-z\s]+?)(?:\s*$|\s+(?:for|by|per|with|using|in))',
+        re.IGNORECASE
+    ),
+]
+
+# Known city names to validate extracted tokens against.
+# Kept intentionally broad — just filters out obvious non-city words.
+_NOT_CITY_WORDS = {
+    'ward', 'wards', 'risk', 'flood', 'hospital', 'hospitals', 'school',
+    'schools', 'park', 'parks', 'road', 'roads', 'density', 'count',
+    'coverage', 'per', 'by', 'in', 'and', 'the', 'a', 'an', 'of',
+    'greenspace', 'vegetation', 'ndvi', 'heat', 'uhi', 'thermal',
+}
+
+
+def _clean_city_token(token: str) -> str:
+    """Strip leading prepositions and whitespace from a captured city token."""
+    token = token.strip()
+    for prep in ('in ', 'for ', 'at ', 'of ', 'the '):
+        if token.lower().startswith(prep):
+            token = token[len(prep):].strip()
+    return token.strip().title()
+
+
+def detect_comparison(task: str, city: str) -> Optional[tuple[str, str, str]]:
+    """
+    Returns (city1, city2, stripped_task) if the query compares two cities.
+    stripped_task has city names and comparison keywords removed.
+    Returns None for single-city queries.
+    """
+    for pattern in _VS_PATTERNS:
+        m = pattern.search(task)
+        if m:
+            c1 = _clean_city_token(m.group(1))
+            c2 = _clean_city_token(m.group(2))
+            # Sanity: both tokens must look like city names (not metric words)
+            if (c1.lower() not in _NOT_CITY_WORDS and
+                    c2.lower() not in _NOT_CITY_WORDS and
+                    len(c1) >= 2 and len(c2) >= 2):
+                # Strip comparison fragment from query to get the core metric
+                stripped = re.sub(
+                    r'\s*(?:in\s+)?' + re.escape(c1) +
+                    r'\s*(?:vs\.?|versus|and)\s*' + re.escape(c2),
+                    '', task, flags=re.IGNORECASE
+                ).strip()
+                stripped = re.sub(r'\s*(?:compare|between)\s*',
+                                  '', stripped, flags=re.IGNORECASE).strip()
+                if not stripped:
+                    stripped = task
+                return c1, c2, stripped
+
+    # Fallback: city field provided + "vs"/"versus"/"compare" in task but no
+    # inline cities found — if city field has "vs" separator use that.
+    if city and re.search(r'\bvs\.?\b|\bversus\b', city, re.IGNORECASE):
+        parts = re.split(r'\s*(?:vs\.?|versus)\s*', city,
+                         maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            c1 = parts[0].strip().title()
+            c2 = parts[1].strip().title()
+            if c1 and c2:
+                return c1, c2, task
+
+    return None
 
 
 # ── Static frontend ───────────────────────────────────────────────────────────
@@ -247,11 +332,12 @@ def get_upload(upload_id: str):
 
 @app.post("/query")
 def create_query(req: QueryRequest):
-    task_id = str(uuid.uuid4())
+    from worker import process_task
+
+    upload_paths: list = []
     conn = get_conn()
     cur = conn.cursor()
 
-    upload_paths: list = []
     if req.session_id:
         cur.execute(
             "SELECT file_path FROM uploads WHERE session_id = %s ORDER BY created_at",
@@ -265,6 +351,43 @@ def create_query(req: QueryRequest):
         if row:
             upload_paths = [row[0]]
 
+    # ── Multi-city comparison detection ──────────────────────────────────────
+    comparison = detect_comparison(req.task, req.city)
+    if comparison:
+        city1, city2, stripped_task = comparison
+        task_id_1 = str(uuid.uuid4())
+        task_id_2 = str(uuid.uuid4())
+
+        cur.execute(
+            "INSERT INTO tasks (id, status, task_text, city) VALUES (%s,%s,%s,%s),(%s,%s,%s,%s)",
+            (task_id_1, "pending", stripped_task, city1,
+             task_id_2, "pending", stripped_task, city2),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        QUERIES_TOTAL.inc()
+        QUERIES_TOTAL.inc()
+
+        process_task.delay(task_id_1, stripped_task, city1,
+                           upload_paths or None, req.domain_hint or None,
+                           req.session_id or task_id_1)
+        process_task.delay(task_id_2, stripped_task, city2,
+                           upload_paths or None, req.domain_hint or None,
+                           req.session_id or task_id_2)
+
+        return {
+            "comparison":  True,
+            "task_id_1":   task_id_1,
+            "task_id_2":   task_id_2,
+            "city1":       city1,
+            "city2":       city2,
+            "metric_task": stripped_task,
+        }
+
+    # ── Normal single-city query ──────────────────────────────────────────────
+    task_id = str(uuid.uuid4())
     cur.execute(
         "INSERT INTO tasks (id, status, task_text, city) VALUES (%s, %s, %s, %s)",
         (task_id, "pending", req.task, req.city),
@@ -275,9 +398,9 @@ def create_query(req: QueryRequest):
 
     QUERIES_TOTAL.inc()
 
-    from worker import process_task
     process_task.delay(task_id, req.task, req.city,
-                       upload_paths or None, req.domain_hint or None)
+                       upload_paths or None, req.domain_hint or None,
+                       req.session_id or task_id)
 
     return {"task_id": task_id, "status": "pending"}
 

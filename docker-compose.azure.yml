@@ -6,8 +6,6 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -20,8 +18,6 @@ services:
   redis:
     image: redis:7-alpine
     container_name: goai_redis
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -32,8 +28,6 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: goai_qdrant
-    ports:
-      - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
@@ -58,11 +52,8 @@ services:
     command: uvicorn app:app --host 0.0.0.0 --port 8000
     volumes:
       - ./app:/app
-      - ./data:/data
+      - /opt/nlgeo/data:/data
     working_dir: /app
-    networks:
-      - default
-      - langfuse_default
     restart: unless-stopped
 
   worker:
@@ -73,9 +64,6 @@ services:
       - POSTGRES_HOST=goai_postgres
       - REDIS_URL=redis://goai_redis:6379/0
       - QDRANT_HOST=goai_qdrant
-      - OLLAMA_HOST=http://host.docker.internal:11434
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,25 +72,8 @@ services:
     command: celery -A worker worker --loglevel=info
     volumes:
       - ./app:/app
-      - ./data:/data
+      - /opt/nlgeo/data:/data
     working_dir: /app
-    networks:
-      - default
-      - langfuse_default
-    restart: unless-stopped
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: goai_prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - type: bind
-        source: ./infra/prometheus.yml
-        target: /etc/prometheus/prometheus.yml
-        read_only: true
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
     restart: unless-stopped
 
   grafana:
@@ -115,16 +86,7 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./infra/grafana/provisioning:/etc/grafana/provisioning
-    depends_on:
-      - prometheus
     restart: unless-stopped
-
-networks:
-  default:
-    name: phase2_default
-  langfuse_default:
-    external: true
 
 volumes:
   postgres_data:

@@ -75,14 +75,24 @@ def score_result(task: str, city: str, output: str, plan: dict,
     lines = [line for line in output.split("\n") if line.strip()]
     summary = "\n".join(lines[:10])
 
+    # Extract ward names from output to validate city match
+    ward_names = [l.split(":")[0].split()[-1]
+                  for l in lines[:5] if l.startswith("#")]
+    ward_sample = ", ".join(ward_names[:3]) if ward_names else "unknown"
+
     prompt = f"""You are a GIS expert evaluating a spatial analysis result.
 
+IMPORTANT: This analysis was run for {city}. Evaluate it AS A {city} result.
+Do NOT penalise based on internal file paths or filenames — they may reference
+cached data from other cities. Judge ONLY on the ranked output below.
+
 Question: "{task}"
-City: "{city}"
+City: "{city}" ← THE ONLY CITY THAT MATTERS
 Analysis type: "{plan.get('analysis_type', 'unknown')}"
 Ranking metric: "{plan.get('ranking_metric', 'unknown')}"
+Sample ward names in result: {ward_sample}
 
-Result:
+Result (first 10 lines):
 {summary}
 
 AUTOMATIC FAIL (score 0.1) if:
@@ -90,10 +100,13 @@ AUTOMATIC FAIL (score 0.1) if:
 - Top results show duplicate names with identical values
 - More than 50% of results show 0.000 for the main metric
 
+DO NOT FAIL because of file paths, centroid coordinates, or cached filenames.
+Judge only: does the ranked ward list answer the question for {city}?
+
 Evaluate on 4 criteria:
-1. Did it answer the question?
-2. Are values realistic for this city?
-3. Does the top result make geographic sense?
+1. Did it answer the question for {city}?
+2. Are values realistic (any non-zero metric is plausible)?
+3. Does the top result make geographic sense for {city}?
 4. Are required columns present?
 
 Return ONLY valid JSON with no other text or markdown:

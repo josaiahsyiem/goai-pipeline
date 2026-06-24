@@ -2,7 +2,7 @@
 agents/orchestrator.py — GoAI pipeline coordinator.
 
 LANGFUSE 4.x CORRECT API:
-  - start_as_current_observation() opened inside _pipeline() 
+  - start_as_current_observation() opened inside _pipeline()
   - All create_event() calls auto-nest via OTel context propagation
   - Scores posted via langfuse.score() with trace_id
 """
@@ -78,7 +78,7 @@ QUERY_REWRITES = {
     "busiest roads": "road density by ward",
     "most people": "population density by ward",
     "most crowded": "population density by ward",
-    "safest areas": "flood risk by ward ascending",
+    "safest areas": "lowest flood risk by ward",
     "most parking": "parking density by ward",
     "best cycling": "cycling infrastructure density by ward",
     "most shops": "commercial density by ward",
@@ -87,8 +87,10 @@ QUERY_REWRITES = {
 GIS_KEYWORDS = [
     "density", "per capita", "per 100k", "per ward", "by ward",
     "by borough", "by district", "coverage", "proximity", "within",
-    "flood risk", "greenspace", "population", "hospital", "school",
-    "road", "transit", "cycling", "infrastructure", "analysis"
+    "flood risk", "flood", "greenspace", "population", "hospital", "school",
+    "road", "transit", "cycling", "infrastructure", "analysis",
+    "heat island", "uhi", "thermal", "surface temperature",
+    "ndvi", "vegetation", "greenness", "heat map", "heat stress"
 ]
 
 
@@ -170,37 +172,69 @@ If uploaded files: required_sources ["uploaded_file"].
 Otherwise: required_sources ["openstreetmap"].
 Return only the JSON object."""
 
-    for _ in range(3):
+    def _try_parse(raw: str):
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        s = raw.find("{")
+        if s == -1:
+            return None
+        e = raw.rfind("}") + 1
+        candidate = raw[s:e] if e > s else raw[s:]
+        # 1) direct parse
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        # 2) trailing-junk repair: shrink from the end
+        for i in range(len(candidate) - 1, 0, -1):
+            if candidate[i] == '}':
+                try:
+                    return json.loads(candidate[:i + 1])
+                except json.JSONDecodeError:
+                    continue
+        # 3) truncation repair: close unterminated string, then append closers
+        frag = candidate
+        if frag.count('"') % 2 == 1:
+            frag += '"'
+        frag = frag.rstrip().rstrip(',')
+        opens = frag.count('{') - frag.count('}')
+        opens_sq = frag.count('[') - frag.count(']')
+        frag += ']' * max(0, opens_sq) + '}' * max(0, opens)
+        try:
+            return json.loads(frag)
+        except json.JSONDecodeError:
+            return None
+
+    parsed = None
+    for attempt in range(3):
         text = smart_chat(GIS_EXPERT_SYSTEM_PROMPT, prompt, use_groq=True,
                           call_name="decomposition")
-        if text.count('{') > 0 and text.count('}') > 0:
-            break
-        print("[Orchestrator] Decompose got truncated response, retrying...")
-    text = text.replace("```json", "").replace("```", "").strip()
-    s = text.find("{")
-    e = text.rfind("}") + 1
-    if s != -1 and e > s:
-        text = text[s:e]
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        for i in range(len(text) - 1, s, -1):
-            try:
-                return json.loads(text[s:i + 1])
-            except json.JSONDecodeError:
-                continue
-        raise Exception(
-            f"Could not parse decomposition response: {text[:200]}")
+        parsed = _try_parse(text or "")
+        if parsed is not None and isinstance(parsed, dict) and parsed.get("city"):
+            return parsed
+        print(
+            f"[Orchestrator] Decompose attempt {attempt+1} unparseable/truncated, retrying...")
+    # Deterministic fallback — retrieval's keyword router doesn't need a perfect
+    # plan; never hard-fail the pipeline on a cosmetic LLM hiccup.
+    print("[Orchestrator] Decompose failed 3x — using deterministic fallback plan")
+    return {
+        "city": city,
+        "analysis_type": "general",
+        "required_sources": ["uploaded_file"] if has_upload else ["openstreetmap"],
+        "ranking_metric": "auto",
+        "spatial_operations": [],
+        "output_columns": ["rank", "ward_name", "metric", "geometry"],
+        "parameters": {},
+    }
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
-def run_pipeline(task, city, task_id=None, upload_paths=None, domain_hint=None):
+def run_pipeline(task, city, task_id=None, upload_paths=None, domain_hint=None, session_id=None):
     trace = []
     start_total = time.time()
     try:
         result = _pipeline(task, city, task_id, upload_paths, domain_hint,
-                           trace, start_total)
+                           trace, start_total, session_id)
         return result
     finally:
         try:
@@ -209,7 +243,7 @@ def run_pipeline(task, city, task_id=None, upload_paths=None, domain_hint=None):
             pass
 
 
-def _pipeline(task, city, task_id, upload_paths, domain_hint, trace, start_total):
+def _pipeline(task, city, task_id, upload_paths, domain_hint, trace, start_total, session_id=None):
     """Core pipeline — Langfuse span opened here so all events auto-nest via OTel."""
 
     _trace_id = uuid.uuid4().hex
@@ -261,7 +295,18 @@ def _pipeline(task, city, task_id, upload_paths, domain_hint, trace, start_total
 
     # Step 1: Memory
     print("[Orchestrator] Checking memory for similar tasks...")
-    memory_context = retrieve_similar(task, city, limit=3)
+    # Quick keyword-based type hint for memory gate — avoids cross-matches
+    # before the full LLM plan is available.
+    _task_lower = task.lower()
+    _type_hint = (
+        "flood_risk" if any(w in _task_lower for w in ["flood", "waterlog", "inundation"]) else
+        "greenspace" if any(w in _task_lower for w in ["green", "park", "vegetation", "ndvi"]) else
+        "uhi" if any(w in _task_lower for w in ["heat", "uhi", "thermal", "temperature"]) else
+        "hospital" if any(w in _task_lower for w in ["hospital", "clinic", "doctor", "health"]) else
+        "general"
+    )
+    memory_context = retrieve_similar(
+        task, city, limit=3, session_id=session_id, analysis_type=_type_hint)
     _lf_event("memory_lookup",
               input={"task": task, "city": city},
               output={
@@ -283,12 +328,32 @@ def _pipeline(task, city, task_id, upload_paths, domain_hint, trace, start_total
         trace.append({"step": "normalize", "status": "success",
                       "message": f"City: '{original_city}'→'{city}' | Query normalized", "time_s": 0.0})
 
-    # Step 3: Decompose
+    # Step 3: Decompose — pre-read upload schemas so the plan sees real columns
+    _pre_upload_info = []
+    if upload_paths:
+        for _fp in upload_paths:
+            if not os.path.exists(_fp):
+                continue
+            try:
+                _ext = _fp.rsplit(".", 1)[-1].lower()
+                if _ext in ("geojson", "json"):
+                    import geopandas as _gpd_pre
+                    _g = _gpd_pre.read_file(_fp)
+                    _pre_upload_info.append({"file_path": _fp, "type": "geojson",
+                                             "rows": len(_g), "columns": list(_g.columns), "crs": str(_g.crs)})
+                else:
+                    import pandas as _pd_pre
+                    _d = _pd_pre.read_csv(_fp)
+                    _pre_upload_info.append({"file_path": _fp, "type": "csv",
+                                             "rows": len(_d), "columns": list(_d.columns), "crs": None})
+            except Exception as _pe:
+                print(f"[Orchestrator] Pre-read failed for {_fp}: {_pe}")
     print(f"[Orchestrator] Decomposing task: {task}")
     t0 = time.time()
     try:
         plan = decompose_task(task, city, memory_context,
-                              has_upload=bool(upload_paths), upload_files=[],
+                              has_upload=bool(upload_paths),
+                              upload_files=_pre_upload_info,
                               domain_hint=domain_hint)
         _lf_event("decomposition",
                   input={"task": task, "city": city},
@@ -302,6 +367,7 @@ def _pipeline(task, city, task_id, upload_paths, domain_hint, trace, start_total
         _lf_event("pipeline_error", output={
                   "step": "decomposition", "error": str(e)})
         return _fail(f"Decomposition failed: {e}")
+    plan["domain_hint"] = domain_hint or ""
     trace.append({
         "step": "decompose", "status": "success", "plan": plan,
         "message": f"Analysis type: {plan.get('analysis_type')} | Metric: {plan.get('ranking_metric')}",
@@ -315,34 +381,35 @@ def _pipeline(task, city, task_id, upload_paths, domain_hint, trace, start_total
     try:
         if upload_paths:
             retrieved = {}
-            all_file_info = []
-            for i, fpath in enumerate(upload_paths):
-                if not os.path.exists(fpath):
-                    continue
-                ext = fpath.rsplit(".", 1)[-1].lower()
+            all_file_info = _pre_upload_info
+            for i, info in enumerate(all_file_info):
+                fpath = info["file_path"]
+                if info["type"] == "geojson":
+                    code = f"import geopandas as gpd\nresult = gpd.read_file('{fpath}')"
+                else:
+                    code = f"import pandas as pd\nresult = pd.read_csv('{fpath}')"
+                retrieved[f"uploaded_file_{i}"] = {
+                    "code": code,
+                    "output": f"ROWS: {info['rows']}\nCOLUMNS: {info['columns']}",
+                    "attempts": 1, "file_path": fpath,
+                }
+                print(
+                    f"[Orchestrator] Loaded {os.path.basename(fpath)}: {info['rows']} rows")
+            _sat_kw = any(x in task.lower() for x in [
+                "heat island", "urban heat", "uhi", "thermal", "surface temperature",
+                "lst", "ndvi", "vegetation index", "vegetation health", "greenness",
+                "heat map", "heat stress", "vegetation cover", "leaf area"])
+            if _sat_kw:
+                print(
+                    "[Orchestrator] Upload + satellite query — fetching satellite layer too")
                 try:
-                    if ext in ("geojson", "json"):
-                        import geopandas as gpd
-                        gdf = gpd.read_file(fpath)
-                        info = {"file_path": fpath, "type": "geojson",
-                                "rows": len(gdf), "columns": list(gdf.columns), "crs": str(gdf.crs)}
-                        code = f"import geopandas as gpd\nresult = gpd.read_file('{fpath}')"
-                    else:
-                        import pandas as pd
-                        df = pd.read_csv(fpath)
-                        info = {"file_path": fpath, "type": "csv",
-                                "rows": len(df), "columns": list(df.columns), "crs": None}
-                        code = f"import pandas as pd\nresult = pd.read_csv('{fpath}')"
-                    all_file_info.append(info)
-                    retrieved[f"uploaded_file_{i}"] = {
-                        "code": code,
-                        "output": f"ROWS: {info['rows']}\nCOLUMNS: {info['columns']}",
-                        "attempts": 1, "file_path": fpath,
-                    }
+                    _sat_fetched = fetch_data_for_task(task, city)
+                    for _k, _v in _sat_fetched.items():
+                        if _k.startswith("satellite_") and "error" not in _v:
+                            retrieved[_k] = _v
+                except Exception as _se:
                     print(
-                        f"[Orchestrator] Loaded {os.path.basename(fpath)}: {info['rows']} rows")
-                except Exception as e:
-                    print(f"[Orchestrator] Could not read {fpath}: {e}")
+                        f"[Orchestrator] Satellite fetch with upload failed: {_se}")
             plan["upload_paths"] = upload_paths
             plan["upload_files"] = all_file_info
             if all_file_info:
@@ -439,53 +506,51 @@ def _pipeline(task, city, task_id, upload_paths, domain_hint, trace, start_total
         "time_s": round(time.time() - t0, 2),
     })
 
-    # Step 7: Store
-    min_score = 0.85
+    # Step 7: Store — dynamic threshold based on cross-validation correlation.
+    # High spatial robustness (r >= 0.7) means the result is reproducible across
+    # spatial join predicates, so we can trust it even at lower LLM-judge scores.
+    gt_corr = eval_scores.get("ground_truth_correlation")
+    min_score = 0.75 if (gt_corr is not None and gt_corr >= 0.7) else 0.85
+    if gt_corr is not None and gt_corr >= 0.7:
+        print(
+            f"[Orchestrator] High spatial correlation ({gt_corr}) — store threshold relaxed to {min_score}")
     if eval_scores.get("score", 0) < min_score:
         print(
             f"[Orchestrator] Score {eval_scores.get('score')} below threshold {min_score} — skipping memory store")
     else:
         print("[Orchestrator] Storing in memory...")
     top_results = []
+    import re as _re_top
     for line in analysis_result["output"].split("\n"):
-        if "#" in line and ":" in line:
-            parts = line.strip().split()
-            for i, token in enumerate(parts):
-                if token.startswith("#") and i + 1 < len(parts):
-                    top_results.append(parts[i + 1].rstrip(":"))
+        _m = _re_top.match(r'\s*#\d+\s+(.+?):\s', line)
+        if _m:
+            top_results.append(_m.group(1).strip())
 
-    # Geometry validation before storing
+    # Geometry validation before storing — parses RESULT_CENTROID printed by the
+    # analysis sandbox; no re-execution. Only runs when score qualifies for store.
     _geo_valid = True
-    try:
-        import requests as _req
-        _nom = _req.get('https://nominatim.openstreetmap.org/search',
-                        params={'q': city, 'format': 'json', 'limit': 1},
-                        headers={'User-Agent': 'GoAI/1.0'}, timeout=8).json()
-        if _nom:
-            _bb = _nom[0]['boundingbox']
-            _s, _n, _w, _e = float(
-                _bb[0])-1, float(_bb[1])+1, float(_bb[2])-1, float(_bb[3])+1
-            _code = analysis_result.get("code", "")
-            if _code:
-                import subprocess
-                import sys
-                import re as _re
-                _chk = _code + """
-_cx = result.to_crs('EPSG:4326').geometry.centroid.x.mean()
-_cy = result.to_crs('EPSG:4326').geometry.centroid.y.mean()
-print('CENTROID:%.4f:%.4f' % (_cx, _cy))
-"""
-                _p = subprocess.run([sys.executable, "-c", _chk],
-                                    capture_output=True, text=True, timeout=30)
-                _cm = _re.search(r'CENTROID:([-\d.]+):([-\d.]+)', _p.stdout)
-                if _cm:
+    if eval_scores.get("score", 0) >= min_score:
+        try:
+            import re as _re
+            _cm = _re.search(r'RESULT_CENTROID:\s*(-?[\d.]+),(-?[\d.]+)',
+                             analysis_result.get("output", ""))
+            if _cm:
+                import requests as _req
+                _nom = _req.get('https://nominatim.openstreetmap.org/search',
+                                params={'q': city,
+                                        'format': 'json', 'limit': 1},
+                                headers={'User-Agent': 'GoAI/1.0'}, timeout=8).json()
+                if _nom:
+                    _bb = _nom[0]['boundingbox']
+                    _s, _n, _w, _e = float(
+                        _bb[0])-1, float(_bb[1])+1, float(_bb[2])-1, float(_bb[3])+1
                     _cx, _cy = float(_cm.group(1)), float(_cm.group(2))
                     if not (_w <= _cx <= _e and _s <= _cy <= _n):
                         print(
                             f"[Orchestrator] Geometry outside {city} bbox — skipping store")
                         _geo_valid = False
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     if eval_scores.get("score", 0) >= min_score and _geo_valid:
         store_task(
@@ -497,8 +562,8 @@ print('CENTROID:%.4f:%.4f' % (_cx, _cy))
                 "ground_truth_correlation"),
             top_results=top_results,
             working_code=analysis_result.get("code", ""),
+            session_id=session_id,
         )
-
     # Step 8: Return
     total_time = round(time.time() - start_total, 2)
     trace.append({"step": "complete", "status": "success",

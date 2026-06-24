@@ -21,6 +21,7 @@ FIXES in this version:
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -34,6 +35,8 @@ try:
     from langfuse_client import langfuse as _lf
 except Exception:
     _lf = None
+SKIP_DETERMINISTIC = os.getenv(
+    "SKIP_DETERMINISTIC", "").lower() in ("true", "1", "yes")
 
 
 def _lf_analysis_event(name, input=None, output=None):
@@ -65,7 +68,8 @@ def run_analysis():
 
     wards  = gpd.read_file('/data/mumbai_ward_shapefile/Mumbai_wards.geojson')
     lr_raw = gpd.read_file('/data/geojson_files/lakes_and_rivers.geojson')
-    rd_raw = gpd.read_file('/data/geojson_files/river_lines_streams_drains.geojson')
+    rd_raw = gpd.read_file(
+        '/data/geojson_files/river_lines_streams_drains.geojson')
 
     if wards.crs is None: wards = wards.set_crs(WGS84)
     if lr_raw.crs is None: lr_raw = lr_raw.set_crs(WGS84)
@@ -99,10 +103,12 @@ def run_analysis():
     flood_utm['geometry'] = flood_utm.apply(
         lambda r: make_valid(r.geometry.buffer(r['buffer_m'])), axis=1
     )
-    flood_utm = flood_utm[flood_utm.geometry.is_valid & ~flood_utm.geometry.is_empty]
+    flood_utm = flood_utm[flood_utm.geometry.is_valid &
+        ~flood_utm.geometry.is_empty]
 
     flood_utm['_key']  = 1
-    flood_zone_union   = flood_utm.dissolve(by='_key')[['geometry']].reset_index(drop=True)
+    flood_zone_union   = flood_utm.dissolve(
+        by='_key')[['geometry']].reset_index(drop=True)
     flood_union_geom   = make_valid(flood_zone_union.geometry.iloc[0])
 
     wards_utm = wards.to_crs(UTM).copy()
@@ -117,12 +123,17 @@ def run_analysis():
         except Exception:
             return 0.0
 
-    wards_utm['flood_area_m2']            = wards_utm.geometry.apply(compute_overlap)
-    wards_utm['flood_overlap_ratio']      = (wards_utm['flood_area_m2'] / wards_utm['ward_area_m2']).clip(0, 1)
-    wards_utm['flood_exposed_population'] = (wards_utm['population'] * wards_utm['flood_overlap_ratio']).round(0).astype(int)
-    wards_utm['area_km2']                 = (wards_utm['ward_area_m2'] / 1e6).round(3)
+    wards_utm['flood_area_m2']            = wards_utm.geometry.apply(
+        compute_overlap)
+    wards_utm['flood_overlap_ratio']      = (
+        wards_utm['flood_area_m2'] / wards_utm['ward_area_m2']).clip(0, 1)
+    wards_utm['flood_exposed_population'] = (
+        wards_utm['population'] * wards_utm['flood_overlap_ratio']).round(0).astype(int)
+    wards_utm['area_km2']                 = (
+        wards_utm['ward_area_m2'] / 1e6).round(3)
 
-    wards_utm = wards_utm.sort_values('flood_exposed_population', ascending=False)
+    wards_utm = wards_utm.sort_values(
+        'flood_exposed_population', ascending=False)
     wards_utm['rank'] = range(1, len(wards_utm) + 1)
 
     result = wards_utm[['rank', 'ward_full', 'population', 'area_km2',
@@ -232,15 +243,20 @@ def is_osmnx_query(plan: dict) -> bool:
             for x in ['osm', 'openstreet', 'open_street', 'open street'])
         for s in sources
     )
-    return has_osm or "mumbai" not in city
+    if has_osm:
+        return True
+    # Non-Mumbai cities need OSMnx ONLY if the user gave us no data to work with
+    has_uploads = bool(plan.get("upload_path")) or bool(
+        plan.get("upload_files"))
+    return "mumbai" not in city and not has_uploads
 
 
 # ── Mumbai metric detection ───────────────────────────────────────────────────
 
 def detect_mumbai_metric(task: str, plan: dict) -> dict:
     task_lower = task.lower()
-    ascending = any(x in task_lower for x in
-                    ['least', 'lowest', 'smallest', 'minimum', 'fewest', 'poorest'])
+    ascending = _hint_ascending(plan, any(x in task_lower for x in
+                                          ['least', 'lowest', 'smallest', 'minimum', 'fewest', 'poorest']))
     if any(x in task_lower for x in ['vulnerable', 'vulnerability', 'combining',
                                      'combined', 'composite', 'risk score']):
         return {"metric": "vulnerability_score", "ascending": ascending}
@@ -305,7 +321,11 @@ def _parse_domain_hint(domain_hint: str) -> dict:
     if match:
         config["buffer_m"] = int(match.group(1))
     for feature in ["river", "lake", "drain", "water", "stream"]:
+        # Both word orders: "300m for river" AND "river buffer 300m" / "river: 300m"
         m = re.search(rf'(\d+)\s*m\s+(?:for\s+)?{feature}', hint)
+        if not m:
+            m = re.search(
+                rf'{feature}s?\s*(?:buffer)?[:\s=]*(\d+)\s*m\b', hint)
         if m:
             config[f"buffer_{feature}_m"] = int(m.group(1))
     m = re.search(r'admin_level[=\s]+(\d+)', hint)
@@ -317,32 +337,69 @@ def _parse_domain_hint(domain_hint: str) -> dict:
     for road in ["motorway", "trunk", "primary", "secondary", "tertiary"]:
         if road in hint:
             config.setdefault("road_types", []).append(road)
-    if any(x in hint for x in ["ascending", "lowest", "least", "worst"]):
+    # "worst" removed — ambiguous (worst flood = MOST flooded). Explicit terms only.
+    if any(x in hint for x in ["ascending", "lowest", "least"]):
         config["ascending"] = True
+    if any(x in hint for x in ["descending", "highest", "most "]):
+        config["ascending"] = False
     if config:
         print(f"[DomainHint] Parsed config: {config}")
     return config
 
 
+def _hint_ascending(plan: dict, default: bool) -> bool:
+    """Expert hint override: ascending from domain_hint beats keyword detection."""
+    hc = plan.get("_hint_config", {})
+    if "ascending" in hc:
+        print(f"[DomainHint] ascending={hc['ascending']} (hint override)")
+        return hc["ascending"]
+    return default
+
+
+def _sq(s: str) -> str:
+    """Escape single quotes for safe embedding inside generated code literals."""
+    return str(s).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _uploaded_boundary(plan: dict):
+    """Best uploaded boundary layer: the geojson with the highest polygon
+    ratio (>=0.5, >=3 rows). Cached in plan to avoid re-reading files."""
+    if "_upload_boundary" in plan:
+        return plan["_upload_boundary"]
+    best, best_ratio = None, 0.0
+    for f in plan.get("upload_files", []):
+        if f.get("type") != "geojson":
+            continue
+        fp = f.get("file_path", "")
+        if not fp or not os.path.exists(fp):
+            continue
+        try:
+            import geopandas as _g
+            gdf = _g.read_file(fp)
+            if len(gdf) < 3:
+                continue
+            ratio = float(gdf.geometry.geom_type.isin(
+                ['Polygon', 'MultiPolygon']).mean())
+            if ratio >= 0.5 and ratio >= best_ratio:
+                best, best_ratio = fp, ratio
+        except Exception:
+            continue
+    plan["_upload_boundary"] = best
+    if best:
+        print(f"[Analysis] Uploaded boundary layer detected: {best}")
+    return best
+
+
+def _hint_utm(plan: dict, detected: str) -> str:
+    """Expert hint override: epsg from domain_hint beats auto-detected UTM."""
+    hc = plan.get("_hint_config", {})
+    if hc.get("epsg"):
+        print(f"[DomainHint] UTM EPSG:{hc['epsg']} (hint override)")
+        return f"EPSG:{hc['epsg']}"
+    return detected
+
+
 # ── Sandbox execution ─────────────────────────────────────────────────────────
-
-# GISclaw Feature 1: Persistent sandbox cache — stores loaded GeoDataFrames
-# between attempts so large files aren't reloaded every retry
-_SANDBOX_CACHE: dict = {}
-
-
-def _get_cache_key(code: str) -> list:
-    """Extract file paths from code to check what's already cached."""
-    import re
-    return re.findall(r"gpd\.read_file\(['\"]([^'\"]+)['\"]\)", code)
-
-
-def clear_sandbox_cache():
-    """Clear the persistent sandbox cache between tasks."""
-    global _SANDBOX_CACHE
-    _SANDBOX_CACHE = {}
-    print("[Sandbox] Cache cleared")
-
 
 def run_code_in_sandbox(code: str, timeout: int = 300) -> dict:
     import ast
@@ -398,7 +455,8 @@ warnings.filterwarnings('ignore')
 import sys, builtins
 _original_import = builtins.__import__
 _BLOCKED = {{'arcpy', 'pykrige', 'skimage', 'arcgis', 'ArcPy'}}
-_REDIRECTS = {{'pykrige': 'scipy.interpolate', 'skimage': 'rasterio', 'arcpy': 'geopandas'}}
+_REDIRECTS = {{'pykrige': 'scipy.interpolate',
+    'skimage': 'rasterio', 'arcpy': 'geopandas'}}
 def _safe_import(name, *args, **kwargs):
     base = name.split('.')[0]
     if base in _BLOCKED:
@@ -412,7 +470,8 @@ builtins.__import__ = _safe_import
 import os as _os
 def list_files(directory='/data/processed'):
     try:
-        files = [f for f in _os.listdir(directory) if f.endswith(('.geojson','.tif','.csv','.shp'))]
+        files = [f for f in _os.listdir(directory) if f.endswith(
+            ('.geojson','.tif','.csv','.shp'))]
         print(f"FILES_IN_{{directory}}: {{files}}")
         return files
     except Exception as e:
@@ -449,10 +508,13 @@ list_files('/data/processed')
 list_files('/data/mumbai_ward_shapefile')
 list_files('/data/geojson_files')
 
+result = None
+
 {code}
 
 if result is None:
-    raise ValueError("result is None — run_analysis() never assigned a GeoDataFrame")
+    raise ValueError(
+        "result is None — run_analysis() never assigned a GeoDataFrame")
 
 # Restore original import
 builtins.__import__ = _original_import
@@ -463,10 +525,33 @@ result = _auto_cast_numerics(result)
 print("ROWS:", len(result))
 print("CRS:", result.crs)
 print("COLUMNS:", list(result.columns))
+try:
+    _cent = result.to_crs('EPSG:4326').geometry.centroid
+    print(f"RESULT_CENTROID: {{_cent.x.mean():.4f}},{{_cent.y.mean():.4f}}")
+except Exception:
+    print("RESULT_CENTROID: NA")
+try:
+    import time as _t
+    _gj_path = f"/data/processed/result_{{_os.getpid()}}_{{int(_t.time()*1000) % 100000}}.geojson"
+    _exp = result.to_crs('EPSG:4326').copy()
+    _exp['geometry'] = _exp.geometry.simplify(0.0001, preserve_topology=True)
+    for _c in list(_exp.columns):
+        if _c != 'geometry' and str(_exp[_c].dtype) == 'object':
+            _exp[_c] = _exp[_c].astype(str)
+    _exp = _exp[_exp.geometry.notna() & _exp.geometry.is_valid]
+    _exp.to_file(_gj_path, driver='GeoJSON')
+    print(f"RESULT_GEOJSON: {{_gj_path}}")
+except Exception as _ge:
+    print(f"RESULT_GEOJSON: NA ({{_ge}})")
 
 # GISclaw Feature 5: variable tracking — report what variables exist
+_WRAPPER_NAMES = {{'result', 'sys', 'gpd', 'pd', 'ox', 'warnings', 'builtins',
+                  'make_valid', 'list_files', 'search_docs', 'run_analysis',
+                  'get_name', 'get_rank'}}
+import types as _types
 _tracked_vars = {{k: type(v).__name__ for k, v in locals().items()
-                  if not k.startswith('_') and k not in ('result', 'sys', 'gpd', 'pd', 'ox', 'warnings')}}
+                  if not k.startswith('_') and k not in _WRAPPER_NAMES
+                  and not callable(v) and not isinstance(v, _types.ModuleType)}}
 print("VARIABLES:", list(_tracked_vars.keys())[:15])
 
 def get_name(row):
@@ -491,8 +576,8 @@ numeric_cols = [
 ]
 has_vuln  = 'vulnerability_score' in cols and 'flood_exposed_population' not in cols
 has_flood = 'flood_exposed_population' in cols
-priority_keywords = ['per_100k', 'per_capita', 'rate', 'density', 'ratio',
-                     'overlap', 'coverage', 'score', 'count', 'length', 'area']
+priority_keywords = ['per_100k', 'per_capita', 'temp', 'ndvi', 'rate', 'count',
+                     'density', 'ratio', 'overlap', 'coverage', 'score', 'length', 'area']
 metric_col = None
 for kw in priority_keywords:
     match = next((c for c in numeric_cols if kw in c.lower()), None)
@@ -501,7 +586,8 @@ for kw in priority_keywords:
         break
 if not metric_col:
     metric_col = next(
-        (c for c in numeric_cols if c not in ['area_km2', 'ward_area_m2', 'flood_area_m2']),
+        (c for c in numeric_cols if c not in [
+         'area_km2', 'ward_area_m2', 'flood_area_m2']),
         numeric_cols[0] if numeric_cols else None
     )
 print("TOP 5 RESULTS:")
@@ -520,18 +606,21 @@ elif metric_col:
         fmt = lambda v: f"{{float(v):.1%}}"
     elif 'per_100k' in col_lower or 'per_capita' in col_lower:
         fmt = lambda v: f"{{float(v):.2f}} per 100k"
+    elif 'temp' in col_lower:
+        fmt = lambda v: f"{{float(v):.1f}} °C"
     elif 'rate' in col_lower:
         fmt = lambda v: f"{{float(v):.2f}}"
     elif 'density' in col_lower:
         fmt = lambda v: f"{{float(v):.3f}}"
     elif 'count' in col_lower or str(result[metric_col].dtype) == 'int64':
-        fmt = lambda v: f"{{int(v):,}} items"
+        fmt = lambda v: f"{{int(v):,}}"
     elif 'area' in col_lower or 'length' in col_lower or 'km' in col_lower:
         fmt = lambda v: f"{{float(v):.3f}} km"
     else:
         fmt = lambda v: f"{{float(v):.3f}}"
     for _, row in result.head(5).iterrows():
-        print(f"  #{{get_rank(row)}} {{get_name(row)}}: {{fmt(row.get(metric_col, 0))}} ({{metric_col}})")
+        print(
+            f"  #{{get_rank(row)}} {{get_name(row)}}: {{fmt(row.get(metric_col, 0))}} ({{metric_col}})")
 else:
     for _, row in result.head(5).iterrows():
         print(f"  #{{get_rank(row)}} {{get_name(row)}}")
@@ -555,14 +644,17 @@ else:
         return {"success": False, "error": f"Sandbox timed out after {timeout}s"}
 
 
-def validate_analysis_output(output: str) -> dict:
+def validate_analysis_output(output: str, task: str = "") -> dict:
     if "ROWS: 0" in output:
         return {"valid": False, "error": "Type 1: analysis returned an empty result"}
     if "ROWS:" not in output:
         return {"valid": False, "error": "Type 1: result variable missing or not a GeoDataFrame"}
     import re
+    _few_ok = any(x in task.lower() for x in [
+        "nearest", "closest", "largest", "biggest", "smallest", "top 1",
+        "which ward", "which area", "single", "the most", "the least"]) if task else False
     match = re.search(r"ROWS:\s*(\d+)", output)
-    if match and int(match.group(1)) < 3:
+    if match and int(match.group(1)) < 3 and not _few_ok:
         return {"valid": False, "error": f"Type 2: result has only {match.group(1)} features — spatial join likely failed silently"}
     if "TOP 5 RESULTS:" in output:
         values = re.findall(
@@ -580,9 +672,11 @@ def validate_code_paths(code: str, retrieved_data: dict) -> dict:
     Based on GTChain paper Section 3.1.3 framework-workflow matching."""
     import re
 
-    # Extract all paths used in gpd.read_file() calls
+    # Extract all paths used in gpd.read_file() AND rasterio.open() calls
     read_file_paths = re.findall(
         r"gpd\.read_file\(['\"]([^'\"]+)['\"]\)", code)
+    read_file_paths += re.findall(
+        r"rasterio\.open\(['\"]([^'\"]+)['\"]", code)
     if not read_file_paths:
         # No file reads — let sandbox catch other errors
         return {"valid": True}
@@ -611,8 +705,11 @@ def validate_code_paths(code: str, retrieved_data: dict) -> dict:
     # Check each path used in code
     invented = []
     for path in read_file_paths:
-        # Skip WorldPop tif paths — those are handled separately
+        # WorldPop tifs auto-download; other tifs must exist on disk
         if path.endswith(".tif"):
+            if "worldpop" in path or os.path.exists(path):
+                continue
+            invented.append(path)
             continue
         # Check if path exists on disk OR is in our valid set
         if not os.path.exists(path) and path not in valid_paths:
@@ -629,41 +726,32 @@ def validate_code_paths(code: str, retrieved_data: dict) -> dict:
     return {"valid": True}
 
 
-def validate_geographic_result(code: str, city: str) -> dict:
-    if not city:
+def validate_geographic_result(output: str, city: str) -> dict:
+    """Checks the RESULT_CENTROID printed by the sandbox against the city's
+    Nominatim bounding box. No re-execution of analysis code."""
+    if not city or not output:
         return {"valid": True}
-    check_code = code + f"""
-import requests, warnings
-warnings.filterwarnings('ignore')
-try:
-    res = requests.get('https://nominatim.openstreetmap.org/search',
-        params={{'q': '{city}', 'format': 'json', 'limit': 1}},
-        headers={{'User-Agent': 'GoAI/1.0'}}, timeout=10)
-    data = res.json()
-    if not data:
-        print("GEO_CHECK: SKIP")
-    else:
-        bbox = data[0].get('boundingbox', [])
-        if len(bbox) == 4:
-            south, north, west, east = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-            south -= 2; north += 2; west -= 2; east += 2
-            centroid = result.to_crs('EPSG:4326').geometry.centroid
-            cx, cy = centroid.x.mean(), centroid.y.mean()
-            if west <= cx <= east and south <= cy <= north:
-                print("GEO_CHECK: PASS")
-            else:
-                print(f"GEO_CHECK: FAIL cx={{cx:.2f}} cy={{cy:.2f}} bbox={{west:.1f}},{{south:.1f}},{{east:.1f}},{{north:.1f}}")
-        else:
-            print("GEO_CHECK: SKIP")
-except Exception as e:
-    print(f"GEO_CHECK: SKIP {{e}}")
-"""
+    import re as _re
+    m = _re.search(r"RESULT_CENTROID:\s*(-?[\d.]+),(-?[\d.]+)", output)
+    if not m:
+        return {"valid": True}
+    cx, cy = float(m.group(1)), float(m.group(2))
     try:
-        proc = subprocess.run([sys.executable, "-c", check_code],
-                              capture_output=True, text=True, timeout=30)
-        if "GEO_CHECK: FAIL" in proc.stdout:
-            return {"valid": False, "error": f"Type 2: result centroid is outside {city} bounding box"}
-        return {"valid": True}
+        import requests as _req
+        res = _req.get('https://nominatim.openstreetmap.org/search',
+                       params={'q': city, 'format': 'json', 'limit': 1},
+                       headers={'User-Agent': 'GoAI/1.0'}, timeout=10)
+        data = res.json()
+        if not data:
+            return {"valid": True}
+        bbox = data[0].get('boundingbox', [])
+        if len(bbox) != 4:
+            return {"valid": True}
+        south, north = float(bbox[0]) - 2, float(bbox[1]) + 2
+        west, east = float(bbox[2]) - 2, float(bbox[3]) + 2
+        if west <= cx <= east and south <= cy <= north:
+            return {"valid": True}
+        return {"valid": False, "error": f"Type 2: result centroid ({cx:.2f},{cy:.2f}) is outside {city} bounding box"}
     except Exception:
         return {"valid": True}
 
@@ -689,29 +777,37 @@ def run_analysis():
     wards['geometry'] = wards['geometry'].apply(make_valid)
     wards_utm = wards.to_crs(UTM)
     wards_utm['area_km2']    = (wards_utm.geometry.area / 1e6).round(3)
-    wards_utm['pop_density'] = (wards_utm['population'] / wards_utm['area_km2']).round(1)
+    wards_utm['pop_density'] = (
+        wards_utm['population'] / wards_utm['area_km2']).round(1)
     if 'flood_overlap_ratio' not in wards_utm.columns:
         wards_utm['flood_overlap_ratio'] = 0.0
     max_flood = wards_utm['flood_overlap_ratio'].max()
     max_dens  = wards_utm['pop_density'].max()
-    wards_utm['flood_norm']          = (wards_utm['flood_overlap_ratio'] / max_flood).round(4) if max_flood > 0 else 0.0
-    wards_utm['pop_density_norm']    = (wards_utm['pop_density'] / max_dens).round(4) if max_dens > 0 else 0.0
-    wards_utm['vulnerability_score'] = (0.5 * wards_utm['flood_norm'] + 0.5 * wards_utm['pop_density_norm']).round(4)
+    wards_utm['flood_norm']          = (
+        wards_utm['flood_overlap_ratio'] / max_flood).round(4) if max_flood > 0 else 0.0
+    wards_utm['pop_density_norm']    = (
+        wards_utm['pop_density'] / max_dens).round(4) if max_dens > 0 else 0.0
+    wards_utm['vulnerability_score'] = (
+        0.5 * wards_utm['flood_norm'] + 0.5 * wards_utm['pop_density_norm']).round(4)
     sort_col  = '{metric}'
-    ascending = {str(ascending)}
+    ascending = {ascending}
     if sort_col not in wards_utm.columns:
         sort_col = 'area_km2'
-    wards_utm = wards_utm.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
+    wards_utm = wards_utm.sort_values(
+        sort_col, ascending=ascending).reset_index(drop=True)
     wards_utm['rank'] = range(1, len(wards_utm) + 1)
-    keep   = ['rank', 'ward_full', 'population', 'area_km2', 'pop_density', 'flood_overlap_ratio', 'vulnerability_score', 'geometry']
-    result = wards_utm[[c for c in keep if c in wards_utm.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    keep   = ['rank', 'ward_full', 'population', 'area_km2', 'pop_density',
+        'flood_overlap_ratio', 'vulnerability_score', 'geometry']
+    result = wards_utm[[c for c in keep if c in wards_utm.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
     sandbox_result = run_code_in_sandbox(code)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print(
                 f"[Analysis] Mumbai general engine success — metric: {metric}")
@@ -723,27 +819,143 @@ run_analysis()
 
 def run_hospital_density_analysis(task: str, plan: dict, retrieved_data: dict) -> dict:
     h_path = retrieved_data.get("osm_hospitals", {}).get("file_path")
-    if not h_path:
+    if not h_path or not os.path.exists(str(h_path)):
+        # Inline fetch fallback: retrieval may have failed (e.g. Overpass timeout).
+        # Fetch hospitals directly via the generic engine so the deterministic
+        # path still fires instead of falling through to the LLM loop.
+        print("[Analysis] osm_hospitals missing — attempting inline fetch")
+        try:
+            from agents.generic_engine import FEATURE_FETCH, _fetch_to_file, _place
+            import hashlib as _hl
+            _city = plan.get("city", "")
+            _ph = int(_hl.md5(("hosp" + _city).encode()
+                              ).hexdigest()[:8], 16) % 1_000_000
+            _hp = "/data/processed/osm_hospitals_inline_%d.geojson" % _ph
+            _code = (FEATURE_FETCH
+                     .replace("__PLACE__", _place(_city))
+                     .replace("__TAGS__", repr({"amenity": ["hospital", "clinic", "doctors"]}))
+                     .replace("__KIND__", "point"))
+            _fp = _fetch_to_file(_code, _hp, 180)
+            if _fp and os.path.exists(_fp):
+                h_path = _fp
+                print("[Analysis] inline hospital fetch succeeded: %s" % _fp)
+        except Exception as _ie:
+            print("[Analysis] inline hospital fetch failed: %s" % _ie)
+    if not h_path or not os.path.exists(str(h_path)):
         return {"success": False, "error": "Missing file path for hospitals"}
 
     # Use osm_boundaries if available, otherwise fall back to mumbai_wards
     b_path = retrieved_data.get("osm_boundaries", {}).get("file_path")
     city = plan.get("city", "").lower()
-    if not b_path:
+    if not b_path or not os.path.exists(str(b_path)):
         if "mumbai" in city:
             b_path = "/data/mumbai_ward_shapefile/Mumbai_wards.geojson"
             print(
                 "[Analysis] osm_boundaries missing — using Mumbai_wards.geojson fallback")
         else:
-            return {"success": False, "error": "Missing file path for boundaries and no local fallback"}
+            # Inline boundary fetch for any city
+            print(
+                "[Analysis] osm_boundaries missing — attempting inline boundary fetch")
+            try:
+                from agents.generic_engine import BOUNDARY_FETCH, _fetch_to_file, _place
+                import hashlib as _hl
+                _city = plan.get("city", "")
+                _bh = int(_hl.md5(("bnd" + _city).encode()
+                                  ).hexdigest()[:8], 16) % 1_000_000
+                _bp = "/data/processed/osm_boundaries_inline_%d.geojson" % _bh
+                # Check persistent cache first
+                _cache_path = "/data/cache/boundaries_%s.geojson" % re.sub(r'[^a-z0-9]', '_', _city.lower().strip())
+                if os.path.exists(_cache_path):
+                    b_path = _cache_path
+                    print("[Analysis] inline boundary cache HIT: %s" % _cache_path)
+                else:
+                    _fp = _fetch_to_file(
+                        BOUNDARY_FETCH.replace("__PLACE__", _place(_city)), _bp, 300)
+                    if _fp and os.path.exists(_fp):
+                        b_path = _fp
+                        # Save to persistent cache
+                        import shutil as _sh
+                        os.makedirs("/data/cache", exist_ok=True)
+                        _sh.copy2(_fp, _cache_path)
+                        print("[Analysis] inline boundary fetch succeeded + cached: %s" % _fp)
+            except Exception as _ie:
+                print("[Analysis] inline boundary fetch failed: %s" % _ie)
 
-    ascending = any(x in task.lower() for x in [
-                    "least", "lowest", "fewest", "worst", "minimum", "poorest"])
+            # Bbox fallback — if full admin boundary fetch timed out, use Nominatim
+            # bbox to fetch boundaries with a shorter clip. Works for London/Amsterdam
+            # where full OSM admin query exceeds timeout.
+            if not b_path or not os.path.exists(str(b_path)):
+                print("[Analysis] Attempting bbox-based boundary fallback...")
+                try:
+                    import requests as _req, geopandas as _gpd2
+                    from shapely.validation import make_valid as _mv
+                    import osmnx as _ox2
+                    _ox2.settings.overpass_url = 'http://overpass-api.de/api/interpreter'
+                    _city2 = plan.get("city", "")
+                    _nr = _req.get(
+                        'https://nominatim.openstreetmap.org/search',
+                        params={'q': _city2, 'format': 'json', 'limit': 1, 'accept-language': 'en'},
+                        headers={'User-Agent': 'GoAI/1.0'}, timeout=20).json()
+                    if _nr:
+                        _bb = _nr[0]['boundingbox']
+                        _s, _n, _w, _e = float(_bb[0]), float(_bb[1]), float(_bb[2]), float(_bb[3])
+                        # Cap span to 1.5 degrees to avoid Pacific islands etc
+                        _cx = (_w + _e) / 2; _cy = (_s + _n) / 2
+                        _w = max(_w, _cx - 0.75); _e = min(_e, _cx + 0.75)
+                        _s = max(_s, _cy - 0.75); _n = min(_n, _cy + 0.75)
+                        _best = None; _best_score = 0
+                        for _lvl in ['8', '9', '7', '10', '6']:
+                            try:
+                                _tags = {'boundary': 'administrative', 'admin_level': _lvl}
+                                _cand = _ox2.features_from_bbox(
+                                    bbox=(_n, _s, _e, _w), tags=_tags).reset_index(drop=True)
+                                if 'boundary' in _cand.columns:
+                                    _cand = _cand[_cand['boundary'] == 'administrative'].copy()
+                                _cand = _cand[_cand.geometry.geom_type.isin(
+                                    ['Polygon', 'MultiPolygon'])].copy()
+                                if 'name' in _cand.columns:
+                                    _cand = _cand[_cand['name'].notna()].copy()
+                                _cand['geometry'] = _cand['geometry'].apply(_mv)
+                                _zone = int((_cx + 180) / 6) + 1
+                                _utm = 'EPSG:%d' % (32600 + _zone if _cy >= 0 else 32700 + _zone)
+                                _cu = _cand.to_crs(_utm)
+                                _areas = _cu.geometry.area / 1e6
+                                _med = _areas.median()
+                                _cand = _cand[(_areas.values >= _med * 0.1) &
+                                              (_areas.values <= _med * 20)].copy().reset_index(drop=True)
+                                if len(_cand) < 3:
+                                    continue
+                                _score = int(((_cand.to_crs(_utm).geometry.area / 1e6 >= 0.1) &
+                                              (_cand.to_crs(_utm).geometry.area / 1e6 <= 500)).sum())
+                                print("[Analysis] bbox fallback lvl=%s n=%d score=%d" % (_lvl, len(_cand), _score))
+                                if _score > _best_score:
+                                    _best_score = _score; _best = _cand
+                            except Exception as _le:
+                                print("[Analysis] bbox fallback lvl=%s failed: %s" % (_lvl, _le))
+                                continue
+                        if _best is not None and len(_best) >= 3:
+                            _bbp = "/data/processed/osm_boundaries_bbox_%d.geojson" % _bh
+                            _best.to_file(_bbp, driver='GeoJSON')
+                            b_path = _bbp
+                            # Cache it
+                            _cache_path2 = "/data/cache/boundaries_%s.geojson" % re.sub(r'[^a-z0-9]', '_', _city2.lower().strip())
+                            import shutil as _sh2
+                            os.makedirs("/data/cache", exist_ok=True)
+                            _sh2.copy2(_bbp, _cache_path2)
+                            print("[Analysis] bbox boundary fallback succeeded: %d units, cached" % len(_best))
+                except Exception as _be:
+                    print("[Analysis] bbox boundary fallback failed: %s" % _be)
+    if not b_path or not os.path.exists(str(b_path)):
+        return {"success": False, "error": "Missing file path for boundaries and no local fallback"}
+
+    ascending = _hint_ascending(plan, any(x in task.lower() for x in [
+        "least", "lowest", "fewest", "worst", "minimum", "poorest"]))
     try:
         import geopandas as _gpd
         utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
     except Exception:
         utm_epsg = 'EPSG:32643'
+    utm_epsg = _hint_utm(plan, utm_epsg)
     code = f"""
 import geopandas as gpd
 import pandas as pd
@@ -762,24 +974,35 @@ def run_analysis():
     else:                     wards     = wards.to_crs(WGS84)
     if hospitals.crs is None: hospitals = hospitals.set_crs(WGS84)
     else:                     hospitals = hospitals.to_crs(WGS84)
-    name_col = next((c for c in wards.columns if c.lower() in ['ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
-    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
     wards_utm     = wards.to_crs(UTM).copy()
     hospitals_utm = hospitals.to_crs(UTM).copy()
-    hospitals_utm['geometry'] = hospitals_utm.geometry.apply(lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
+    hospitals_utm['geometry'] = hospitals_utm.geometry.apply(
+        lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
     wards_utm['area_km2'] = (wards_utm.geometry.area / 1e6).round(3)
-    joined = gpd.sjoin(hospitals_utm[['geometry']], wards_utm[['geometry','ward_name','area_km2']], how='left', predicate='intersects')
+    joined = gpd.sjoin(hospitals_utm[['geometry']], wards_utm[[
+                       'geometry','ward_name','area_km2']], how='left', predicate='intersects')
     joined = joined.drop(columns='geometry')
-    counts = joined.groupby('ward_name').size().reset_index(name='hospital_count')
+    counts = joined.groupby('ward_name').size(
+    ).reset_index(name='hospital_count')
     merged = wards_utm.merge(counts, on='ward_name', how='left')
     merged['hospital_count']   = merged['hospital_count'].fillna(0).astype(int)
-    merged['hospital_density'] = (merged['hospital_count'] / merged['area_km2'].replace(0, float('nan'))).round(4).fillna(0)
-    ascending = {str(ascending)}
+    merged['hospital_density'] = (
+        merged['hospital_count'] / merged['area_km2'].replace(0, float('nan'))).round(4).fillna(0)
+    ascending = {ascending}
     merged = merged.drop_duplicates(subset='ward_name', keep='first')
+    merged = merged.sort_values(
+        'hospital_count', ascending=ascending).reset_index(drop=True)
     merged['rank'] = range(1, len(merged) + 1)
-    keep   = ['rank','ward_name','hospital_count','hospital_density','area_km2','geometry']
-    result = merged[[c for c in keep if c in merged.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    keep   = ['rank','ward_name','hospital_count',
+        'hospital_density','area_km2','geometry']
+    result = merged[[c for c in keep if c in merged.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
@@ -787,7 +1010,7 @@ run_analysis()
         f"[Analysis] Running hospital density for {city} (UTM: {utm_epsg})...")
     sandbox_result = run_code_in_sandbox(code)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Hospital density succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -805,13 +1028,15 @@ def run_road_density_analysis(task: str, plan: dict, retrieved_data: dict) -> di
     if not b_path or not r_path:
         return {"success": False, "error": "Missing file paths for boundaries or roads"}
     city = plan.get("city", "")
-    ascending = any(x in task.lower() for x in [
-                    "least", "lowest", "fewest", "worst", "minimum", "poorest"])
+    ascending = _hint_ascending(plan, any(x in task.lower() for x in [
+        "least", "lowest", "fewest", "worst", "minimum", "poorest"]))
     try:
         import geopandas as _gpd
         utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
     except Exception:
         utm_epsg = 'EPSG:32643'
+    utm_epsg = _hint_utm(plan, utm_epsg)
+    _road_types = plan.get("_hint_config", {}).get("road_types", [])
     code = f"""
 import geopandas as gpd
 import pandas as pd
@@ -824,38 +1049,53 @@ def run_analysis():
     UTM, WGS84 = '{utm_epsg}', 'EPSG:4326'
     wards = gpd.read_file('{b_path}')
     edges = gpd.read_file('{r_path}')
+    _rt = {_road_types!r}
+    if _rt and 'highway' in edges.columns:
+        edges = edges[edges['highway'].astype(
+            str).str.lower().isin(_rt)].copy()
+        print(f"Road type filter: {{len(edges)}} edges ({{_rt}})")
     wards['geometry'] = wards['geometry'].apply(make_valid)
     edges['geometry'] = edges['geometry'].apply(make_valid)
     if wards.crs is None: wards = wards.set_crs(WGS84)
     else:                 wards = wards.to_crs(WGS84)
     if edges.crs is None: edges = edges.set_crs(WGS84)
     else:                 edges = edges.to_crs(WGS84)
-    name_col = next((c for c in wards.columns if c.lower() in ['ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
-    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
     wards_utm = wards.to_crs(UTM).copy()
     edges_utm = edges.to_crs(UTM).copy()
     wards_utm['area_km2'] = (wards_utm.geometry.area / 1e6).round(3)
     edges_utm['length_m'] = edges_utm.geometry.length
-    joined = gpd.sjoin(edges_utm[['geometry','length_m']], wards_utm[['geometry','ward_name','area_km2']], how='left', predicate='intersects')
+    joined = gpd.sjoin(edges_utm[['geometry','length_m']], wards_utm[[
+                       'geometry','ward_name','area_km2']], how='left', predicate='intersects')
     joined = joined.drop(columns='geometry')
     road_lengths = joined.groupby('ward_name')['length_m'].sum().reset_index()
     road_lengths['road_length_km'] = (road_lengths['length_m'] / 1000).round(3)
-    merged = wards_utm.merge(road_lengths[['ward_name','road_length_km']], on='ward_name', how='left')
+    merged = wards_utm.merge(
+        road_lengths[['ward_name','road_length_km']], on='ward_name', how='left')
     merged['road_length_km'] = merged['road_length_km'].fillna(0)
-    merged['road_density']   = (merged['road_length_km'] / merged['area_km2'].replace(0, float('nan'))).round(3).fillna(0)
-    ascending = {str(ascending)}
+    merged['road_density']   = (
+        merged['road_length_km'] / merged['area_km2'].replace(0, float('nan'))).round(3).fillna(0)
+    ascending = {ascending}
     merged = merged.drop_duplicates(subset='ward_name', keep='first')
+    merged = merged.sort_values(
+        'road_density', ascending=ascending).reset_index(drop=True)
     merged['rank'] = range(1, len(merged) + 1)
-    keep   = ['rank','ward_name','road_length_km','road_density','area_km2','geometry']
-    result = merged[[c for c in keep if c in merged.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    keep   = ['rank','ward_name','road_length_km',
+        'road_density','area_km2','geometry']
+    result = merged[[c for c in keep if c in merged.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
     print(f"[Analysis] Running road density for {city} (UTM: {utm_epsg})...")
     sandbox_result = run_code_in_sandbox(code, timeout=600)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Road density succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -876,13 +1116,14 @@ def run_flood_risk_analysis(task: str, plan: dict, retrieved_data: dict, domain_
     if not b_path or not w_path:
         return {"success": False, "error": "Missing file paths for boundaries or water"}
     city = plan.get("city", "")
-    ascending = any(x in task.lower()
-                    for x in ["least", "lowest", "safest", "minimum", "best"])
+    ascending = _hint_ascending(plan, any(x in task.lower()
+                                          for x in ["least", "lowest", "safest", "minimum", "best"]))
     try:
         import geopandas as _gpd
         utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
     except Exception:
         utm_epsg = 'EPSG:32643'
+    utm_epsg = _hint_utm(plan, utm_epsg)
     code = f"""
 import geopandas as gpd
 import pandas as pd
@@ -902,8 +1143,10 @@ def run_analysis():
     else:                 wards = wards.to_crs(WGS84)
     if water.crs is None: water = water.set_crs(WGS84)
     else:                 water = water.to_crs(WGS84)
-    name_col = next((c for c in wards.columns if c.lower() in ['ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
-    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
     wards_utm = wards.to_crs(UTM).copy()
     water_utm = water.to_crs(UTM).copy()
     water_utm['geometry'] = water_utm.geometry.buffer({default_buffer})
@@ -917,15 +1160,22 @@ def run_analysis():
             return inter.area if not inter.is_empty else 0.0
         except Exception:
             return 0.0
-    wards_utm['flood_area_m2']       = wards_utm.geometry.apply(compute_overlap)
-    wards_utm['flood_overlap_ratio'] = (wards_utm['flood_area_m2'] / wards_utm['ward_area_m2']).clip(0, 1).round(4)
-    wards_utm['area_km2']            = (wards_utm['ward_area_m2'] / 1e6).round(3)
-    ascending = {str(ascending)}
+    wards_utm['flood_area_m2']       = wards_utm.geometry.apply(
+        compute_overlap)
+    wards_utm['flood_overlap_ratio'] = (
+        wards_utm['flood_area_m2'] / wards_utm['ward_area_m2']).clip(0, 1).round(4)
+    wards_utm['area_km2']            = (
+        wards_utm['ward_area_m2'] / 1e6).round(3)
+    ascending = {ascending}
     wards_utm = wards_utm.drop_duplicates(subset='ward_name', keep='first')
+    wards_utm = wards_utm.sort_values(
+        'flood_overlap_ratio', ascending=ascending).reset_index(drop=True)
     wards_utm['rank'] = range(1, len(wards_utm) + 1)
     keep   = ['rank','ward_name','flood_overlap_ratio','area_km2','geometry']
-    result = wards_utm[[c for c in keep if c in wards_utm.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    result = wards_utm[[c for c in keep if c in wards_utm.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
@@ -933,7 +1183,7 @@ run_analysis()
         f"[Analysis] Running flood risk for {city} (UTM: {utm_epsg}, buffer: {default_buffer}m)...")
     sandbox_result = run_code_in_sandbox(code, timeout=600)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Flood risk succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -947,16 +1197,37 @@ run_analysis()
 
 def run_greenspace_analysis(task: str, plan: dict, retrieved_data: dict) -> dict:
     g_path = retrieved_data.get("osm_greenspace", {}).get("file_path")
-    if not g_path:
+    if not g_path or not os.path.exists(str(g_path)):
+        # Inline fetch fallback when retrieval failed
+        print("[Analysis] osm_greenspace missing — attempting inline fetch")
+        try:
+            from agents.generic_engine import FEATURE_FETCH, _fetch_to_file, _place
+            import hashlib as _hl
+            _city = plan.get("city", "")
+            _ph = int(_hl.md5(("green" + _city).encode()
+                              ).hexdigest()[:8], 16) % 1_000_000
+            _gp = "/data/processed/osm_greenspace_inline_%d.geojson" % _ph
+            _code = (FEATURE_FETCH
+                     .replace("__PLACE__", _place(_city))
+                     .replace("__TAGS__", repr({"leisure": ["park"], "landuse": ["forest", "grass", "recreation_ground", "meadow"]}))
+                     .replace("__KIND__", "area"))
+            _fp = _fetch_to_file(_code, _gp, 180)
+            if _fp and os.path.exists(_fp):
+                g_path = _fp
+                print("[Analysis] inline greenspace fetch succeeded: %s" % _fp)
+        except Exception as _ie:
+            print("[Analysis] inline greenspace fetch failed: %s" % _ie)
+    if not g_path or not os.path.exists(str(g_path)):
         return {"success": False, "error": "Missing file path for greenspace"}
     city = plan.get("city", "")
-    ascending = any(x in task.lower()
-                    for x in ["least", "lowest", "minimum", "worst", "fewest"])
+    ascending = _hint_ascending(plan, any(x in task.lower()
+                                          for x in ["least", "lowest", "minimum", "worst", "fewest"]))
     try:
         import geopandas as _gpd
         utm_epsg = _get_utm_epsg(_gpd.read_file(g_path))
     except Exception:
         utm_epsg = 'EPSG:32643'  # fallback to India UTM, _get_utm_epsg handles correct zone
+    utm_epsg = _hint_utm(plan, utm_epsg)
     code = f"""
 import geopandas as gpd
 import pandas as pd
@@ -971,29 +1242,35 @@ def run_analysis():
     green['geometry'] = green['geometry'].apply(make_valid)
     if green.crs is None: green = green.set_crs(WGS84)
     else:                 green = green.to_crs(WGS84)
-    green     = green[green.geometry.geom_type.isin(['Polygon','MultiPolygon'])].copy()
+    green     = green[green.geometry.geom_type.isin(
+        ['Polygon','MultiPolygon'])].copy()
     green     = green[green.geometry.notna() & green.geometry.is_valid].copy()
     green_utm = green.to_crs(UTM).copy()
     green_utm['area_km2'] = (green_utm.geometry.area / 1e6).round(4)
-    name_col = next((c for c in ['name','Name','NAME','label','title','leisure','landuse','natural'] if c in green_utm.columns), None)
+    name_col = next((c for c in ['name','Name','NAME','label','title',
+                    'leisure','landuse','natural'] if c in green_utm.columns), None)
     if name_col:
-        green_utm['ward_name'] = green_utm[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unnamed').astype(str).str.strip()
+        green_utm['ward_name'] = green_utm[name_col].apply(lambda x: x[0] if isinstance(
+            x, list) else x).fillna('Unnamed').astype(str).str.strip()
     else:
         green_utm['ward_name'] = 'Unnamed'
     green_utm = green_utm[green_utm['area_km2'] > 0.001].copy()
-    ascending = {str(ascending)}
-    green_utm = green_utm.sort_values('area_km2', ascending=ascending).reset_index(drop=True)
+    ascending = {ascending}
+    green_utm = green_utm.sort_values(
+        'area_km2', ascending=ascending).reset_index(drop=True)
     green_utm['rank'] = range(1, len(green_utm) + 1)
     keep   = ['rank','ward_name','area_km2','geometry']
-    result = green_utm[[c for c in keep if c in green_utm.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    result = green_utm[[c for c in keep if c in green_utm.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
     print(f"[Analysis] Running greenspace for {city} (UTM: {utm_epsg})...")
     sandbox_result = run_code_in_sandbox(code)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Greenspace succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -1008,16 +1285,37 @@ run_analysis()
 def run_schools_analysis(task: str, plan: dict, retrieved_data: dict) -> dict:
     b_path = retrieved_data.get("osm_boundaries", {}).get("file_path")
     s_path = retrieved_data.get("osm_schools", {}).get("file_path")
-    if not b_path or not s_path:
+    if not s_path or not os.path.exists(str(s_path)):
+        # Inline fetch fallback when retrieval failed
+        print("[Analysis] osm_schools missing — attempting inline fetch")
+        try:
+            from agents.generic_engine import FEATURE_FETCH, _fetch_to_file, _place
+            import hashlib as _hl
+            _city = plan.get("city", "")
+            _ph = int(_hl.md5(("sch" + _city).encode()
+                              ).hexdigest()[:8], 16) % 1_000_000
+            _sp = "/data/processed/osm_schools_inline_%d.geojson" % _ph
+            _code = (FEATURE_FETCH
+                     .replace("__PLACE__", _place(_city))
+                     .replace("__TAGS__", repr({"amenity": ["school", "university", "college", "kindergarten"]}))
+                     .replace("__KIND__", "point"))
+            _fp = _fetch_to_file(_code, _sp, 180)
+            if _fp and os.path.exists(_fp):
+                s_path = _fp
+                print("[Analysis] inline schools fetch succeeded: %s" % _fp)
+        except Exception as _ie:
+            print("[Analysis] inline schools fetch failed: %s" % _ie)
+    if not b_path or not s_path or not os.path.exists(str(s_path)):
         return {"success": False, "error": "Missing file paths for boundaries or schools"}
-    city = plan.get("city", "")
-    ascending = any(x in task.lower() for x in [
-                    "least", "lowest", "fewest", "worst", "minimum", "poorest"])
+    city = _sq(plan.get("city", ""))
+    ascending = _hint_ascending(plan, any(x in task.lower() for x in [
+        "least", "lowest", "fewest", "worst", "minimum", "poorest"]))
     try:
         import geopandas as _gpd
         utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
     except Exception:
         utm_epsg = 'EPSG:32643'
+    utm_epsg = _hint_utm(plan, utm_epsg)
     code = f"""
 import geopandas as gpd
 import pandas as pd
@@ -1036,34 +1334,45 @@ def run_analysis():
     else:                   wards   = wards.to_crs(WGS84)
     if schools.crs is None: schools = schools.set_crs(WGS84)
     else:                   schools = schools.to_crs(WGS84)
-    name_col = next((c for c in wards.columns if c.lower() in ['ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
-    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
     wards_utm   = wards.to_crs(UTM).copy()
     schools_utm = schools.to_crs(UTM).copy()
-    schools_utm['geometry'] = schools_utm.geometry.apply(lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
+    schools_utm['geometry'] = schools_utm.geometry.apply(
+        lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
     wards_utm['area_km2'] = (wards_utm.geometry.area / 1e6).round(3)
-    joined = gpd.sjoin(schools_utm[['geometry']], wards_utm[['geometry','ward_name','area_km2']], how='left', predicate='intersects')
+    joined = gpd.sjoin(schools_utm[['geometry']], wards_utm[[
+                       'geometry','ward_name','area_km2']], how='left', predicate='intersects')
     joined = joined.drop(columns='geometry')
-    counts = joined.groupby('ward_name').size().reset_index(name='school_count')
+    counts = joined.groupby('ward_name').size(
+    ).reset_index(name='school_count')
     merged = wards_utm.merge(counts, on='ward_name', how='left')
     merged['school_count']   = merged['school_count'].fillna(0).astype(int)
-    merged['school_density'] = (merged['school_count'] / merged['area_km2'].replace(0, float('nan'))).round(4).fillna(0)
+    merged['school_density'] = (
+        merged['school_count'] / merged['area_km2'].replace(0, float('nan'))).round(4).fillna(0)
     merged = merged.drop_duplicates(subset='ward_name', keep='first')
-    merged = merged[merged['ward_name'].str.lower().str.strip() != '{city}'.lower().strip()]
+    merged = merged[merged['ward_name'].str.lower().str.strip()
+                                                  != '{city}'.lower().strip()]
     merged = merged[merged['ward_name'].str.lower().str.strip() != '']
-    ascending = {str(ascending)}
-    merged = merged.sort_values('school_count', ascending=ascending).reset_index(drop=True)
+    ascending = {ascending}
+    merged = merged.sort_values(
+        'school_count', ascending=ascending).reset_index(drop=True)
     merged['rank'] = range(1, len(merged) + 1)
-    keep   = ['rank','ward_name','school_count','school_density','area_km2','geometry']
-    result = merged[[c for c in keep if c in merged.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    keep   = ['rank','ward_name','school_count',
+        'school_density','area_km2','geometry']
+    result = merged[[c for c in keep if c in merged.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
     print(f"[Analysis] Running schools for {city} (UTM: {utm_epsg})...")
     sandbox_result = run_code_in_sandbox(code, timeout=600)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Schools succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -1091,6 +1400,7 @@ def generate_osmnx_analysis_code(task: str, plan: dict) -> str:
         place = f"{city}, France"
     else:
         place = city
+    place = _sq(place)
     utm_inline = """
     cx   = gdf.to_crs('EPSG:4326').geometry.unary_union.centroid.x
     cy   = gdf.to_crs('EPSG:4326').geometry.unary_union.centroid.y
@@ -1138,12 +1448,14 @@ def run_analysis():
     lat, lon = location[0], location[1]
     # Get features within radius
     tags = {prox_tags}
-    gdf = ox.features_from_point((lat, lon), tags=tags, dist={radius_km * 1000})
+    gdf = ox.features_from_point(
+        (lat, lon), tags=tags, dist={radius_km * 1000})
     gdf = gdf.reset_index()
     gdf['geometry'] = gdf['geometry'].apply(make_valid)
     gdf = gdf.to_crs('EPSG:4326')
     # Convert polygons to centroids for distance calc
-    gdf['geometry'] = gdf.geometry.apply(lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
+    gdf['geometry'] = gdf.geometry.apply(lambda g: g.centroid if g.geom_type in [
+                                         'Polygon','MultiPolygon'] else g)
     # Compute distance from city center
     from shapely.geometry import Point
     center = Point(lon, lat)
@@ -1151,15 +1463,20 @@ def run_analysis():
     zone = int((cx + 180) / 6) + 1
     UTM = f'EPSG:{{32600 + zone if cy >= 0 else 32700 + zone}}'
     gdf_utm = gdf.to_crs(UTM)
-    center_utm = gpd.GeoDataFrame(geometry=[center], crs='EPSG:4326').to_crs(UTM).geometry.iloc[0]
-    gdf_utm['distance_km'] = (gdf_utm.geometry.distance(center_utm) / 1000).round(2)
-    name_col = next((c for c in ['name','Name','amenity','aeroway','railway'] if c in gdf_utm.columns), gdf_utm.columns[0])
-    gdf_utm['ward_name'] = gdf_utm[name_col].apply(lambda x: x[0] if isinstance(x,list) else x).fillna('Unknown').astype(str).str.strip()
+    center_utm = gpd.GeoDataFrame(
+        geometry=[center], crs='EPSG:4326').to_crs(UTM).geometry.iloc[0]
+    gdf_utm['distance_km'] = (
+        gdf_utm.geometry.distance(center_utm) / 1000).round(2)
+    name_col = next((c for c in ['name','Name','amenity','aeroway',
+                    'railway'] if c in gdf_utm.columns), gdf_utm.columns[0])
+    gdf_utm['ward_name'] = gdf_utm[name_col].apply(lambda x: x[0] if isinstance(
+        x,list) else x).fillna('Unknown').astype(str).str.strip()
     gdf_utm = gdf_utm[gdf_utm['ward_name'] != 'Unknown'].copy()
     gdf_utm = gdf_utm.sort_values('distance_km').reset_index(drop=True)
     gdf_utm['rank'] = range(1, len(gdf_utm) + 1)
     keep = ['rank', 'ward_name', 'distance_km', 'geometry']
-    result = gdf_utm[[c for c in keep if c in gdf_utm.columns]].to_crs('EPSG:4326').reset_index(drop=True)
+    result = gdf_utm[[c for c in keep if c in gdf_utm.columns]].to_crs(
+        'EPSG:4326').reset_index(drop=True)
     print(f"Found {{len(result)}} {prox_name} within {radius_km}km of {place}")
 
 run_analysis()
@@ -1173,9 +1490,11 @@ import warnings; warnings.filterwarnings('ignore')
 
 def run_analysis():
     global result
-    tags  = {{'leisure': 'park', 'landuse': ['forest', 'grass', 'recreation_ground']}}
+    tags  = {{'leisure': 'park', 'landuse': [
+        'forest', 'grass', 'recreation_ground']}}
     parks = ox.features_from_place('{place}', tags).reset_index()
-    parks = parks[parks.geometry.geom_type.isin(['Polygon','MultiPolygon'])].copy()
+    parks = parks[parks.geometry.geom_type.isin(
+        ['Polygon','MultiPolygon'])].copy()
     parks['geometry'] = parks['geometry'].apply(make_valid)
     gdf = parks
     cx = parks.to_crs('EPSG:4326').geometry.unary_union.centroid.x
@@ -1184,12 +1503,16 @@ def run_analysis():
     UTM  = f'EPSG:{{32600 + zone if cy >= 0 else 32700 + zone}}'
     parks_utm = parks.to_crs(UTM)
     parks_utm['area_km2'] = (parks_utm.geometry.area / 1_000_000).round(4)
-    name_col = next((c for c in ['name','Name','leisure','landuse'] if c in parks_utm.columns), None)
-    parks_utm['area_name'] = parks_utm[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unnamed').astype(str) if name_col else 'Unnamed'
-    parks_utm = parks_utm.sort_values('area_km2', ascending=False).reset_index(drop=True)
+    name_col = next(
+        (c for c in ['name','Name','leisure','landuse'] if c in parks_utm.columns), None)
+    parks_utm['area_name'] = parks_utm[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unnamed').astype(str) if name_col else 'Unnamed'
+    parks_utm = parks_utm.sort_values(
+        'area_km2', ascending=False).reset_index(drop=True)
     parks_utm['rank'] = range(1, len(parks_utm) + 1)
     extra  = [c for c in ['leisure','landuse'] if c in parks_utm.columns]
-    result = parks_utm[['rank','area_name','area_km2','geometry'] + extra].to_crs('EPSG:4326').reset_index(drop=True)
+    result = parks_utm[['rank','area_name','area_km2','geometry'] + \
+        extra].to_crs('EPSG:4326').reset_index(drop=True)
 
 run_analysis()
 """
@@ -1202,7 +1525,8 @@ import warnings; warnings.filterwarnings('ignore')
 def run_analysis():
     global result
     wards = ox.geocode_to_gdf('{place}').reset_index(drop=True)
-    water = ox.features_from_place('{place}', {{'natural': ['water','coastline'], 'waterway': ['river','stream','drain']}}).reset_index()
+    water = ox.features_from_place('{place}', {{'natural': [
+                                   'water','coastline'], 'waterway': ['river','stream','drain']}}).reset_index()
     water['geometry'] = water['geometry'].apply(make_valid)
     cx = wards.to_crs('EPSG:4326').geometry.unary_union.centroid.x
     cy = wards.to_crs('EPSG:4326').geometry.unary_union.centroid.y
@@ -1213,12 +1537,17 @@ def run_analysis():
     water_utm['geometry'] = water_utm.geometry.buffer(2000)
     flood_zone = water_utm.dissolve().geometry.iloc[0]
     wards_utm['ward_area_m2']        = wards_utm.geometry.area
-    wards_utm['flood_area_m2']       = wards_utm.geometry.apply(lambda g: make_valid(g).intersection(flood_zone).area)
-    wards_utm['flood_overlap_ratio'] = (wards_utm['flood_area_m2'] / wards_utm['ward_area_m2']).clip(0, 1)
-    wards_utm['area_km2']            = (wards_utm['ward_area_m2'] / 1e6).round(3)
-    wards_utm = wards_utm.sort_values('flood_overlap_ratio', ascending=False).reset_index(drop=True)
+    wards_utm['flood_area_m2']       = wards_utm.geometry.apply(
+        lambda g: make_valid(g).intersection(flood_zone).area)
+    wards_utm['flood_overlap_ratio'] = (
+        wards_utm['flood_area_m2'] / wards_utm['ward_area_m2']).clip(0, 1)
+    wards_utm['area_km2']            = (
+        wards_utm['ward_area_m2'] / 1e6).round(3)
+    wards_utm = wards_utm.sort_values(
+        'flood_overlap_ratio', ascending=False).reset_index(drop=True)
     wards_utm['rank'] = range(1, len(wards_utm) + 1)
-    result = wards_utm[['rank','area_km2','flood_overlap_ratio','geometry']].to_crs('EPSG:4326')
+    result = wards_utm[['rank','area_km2',
+        'flood_overlap_ratio','geometry']].to_crs('EPSG:4326')
 
 run_analysis()
 """
@@ -1241,10 +1570,12 @@ def run_analysis():
     best = None
     for level in ['10','9','8','7']:
         try:
-            candidate = ox.features_from_place('{place}', {{'boundary':'administrative','admin_level':level}}).reset_index(drop=True)
+            candidate = ox.features_from_place('{place}', {{'boundary': 'administrative', 'admin_level': level}}).reset_index(drop=True)
             if 'boundary' in candidate.columns:
-                candidate = candidate[candidate['boundary']=='administrative'].copy()
-            candidate = candidate[candidate.geometry.geom_type.isin(['Polygon','MultiPolygon'])].copy()
+                candidate = candidate[candidate['boundary']
+                    =='administrative'].copy()
+            candidate = candidate[candidate.geometry.geom_type.isin(
+                ['Polygon','MultiPolygon'])].copy()
             for col in ['leisure','landuse','natural']:
                 if col in candidate.columns:
                     candidate = candidate[candidate[col].isna()].copy()
@@ -1256,12 +1587,15 @@ def run_analysis():
             candidate_utm = candidate.to_crs(UTM)
             keep_mask     = candidate_utm.geometry.area < city_area_utm * 1.5
             candidate     = candidate[keep_mask].copy().reset_index(drop=True)
-            candidate_utm = candidate_utm[keep_mask].copy().reset_index(drop=True)
+            candidate_utm = candidate_utm[keep_mask].copy(
+            ).reset_index(drop=True)
             intersects    = candidate_utm.geometry.intersects(city_geom_utm)
-            candidate     = candidate[intersects.values].copy().reset_index(drop=True)
+            candidate     = candidate[intersects.values].copy(
+            ).reset_index(drop=True)
             if len(candidate) >= 3:
                 best = candidate
-                print(f'OSMnx template: admin_level={{level}}, {{len(best)}} neighborhoods')
+                print(
+                    f'OSMnx template: admin_level={{level}}, {{len(best)}} neighborhoods')
                 break
         except Exception:
             continue
@@ -1271,11 +1605,15 @@ def run_analysis():
     best['geometry'] = best['geometry'].apply(make_valid)
     gdf_utm = best.to_crs(UTM)
     gdf_utm['area_km2'] = (gdf_utm.geometry.area / 1e6).round(3)
-    name_col = next((c for c in ['name','Name','NAME'] if c in gdf_utm.columns), gdf_utm.columns[0])
-    gdf_utm['ward_name'] = gdf_utm[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
-    gdf_utm = gdf_utm.sort_values('area_km2', ascending=False).reset_index(drop=True)
+    name_col = next((c for c in ['name','Name','NAME']
+                    if c in gdf_utm.columns), gdf_utm.columns[0])
+    gdf_utm['ward_name'] = gdf_utm[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
+    gdf_utm = gdf_utm.sort_values(
+        'area_km2', ascending=False).reset_index(drop=True)
     gdf_utm['rank'] = range(1, len(gdf_utm) + 1)
-    result = gdf_utm[['rank','ward_name','area_km2','geometry']].to_crs('EPSG:4326')
+    result = gdf_utm[['rank','ward_name',
+        'area_km2','geometry']].to_crs('EPSG:4326')
 
 run_analysis()
 """
@@ -1414,6 +1752,31 @@ def understand_data(retrieved_data: dict, plan: dict) -> str:
     if not retrieved_data:
         return ""
     import geopandas as gpd
+    # ── Mid-conversation state message (GeoGPT/Holm 2024 trick) ──────────────
+    # Inject a structured [SYSTEM STATE] block so the LLM always knows exactly
+    # which files are available on disk. Prevents invented paths and redundant
+    # re-fetches on retry attempts (the "dead-end" problem Holm identifies).
+    state_lines = [
+        "[SYSTEM STATE] The following data has already been fetched and saved:"]
+    any_state = False
+    for source_name, source_data in retrieved_data.items():
+        fp = source_data.get("file_path")
+        if fp and os.path.exists(str(fp)):
+            state_lines.append(f"  - {source_name}: {fp}")
+            any_state = True
+    upload_files = plan.get("upload_files", [])
+    for f in upload_files:
+        fp = f.get("file_path", "")
+        if fp and os.path.exists(fp):
+            state_lines.append(f"  - uploaded_file: {fp}")
+            any_state = True
+    if any_state:
+        state_lines.append(
+            "Use ONLY these exact paths in your code. Do NOT fetch data again or invent new paths.")
+        state_block = "\n".join(state_lines)
+    else:
+        state_block = ""
+
     lines = ["Data overview (auto-extracted):"]
     for source_name, source_data in retrieved_data.items():
         if "output" not in source_data:
@@ -1470,7 +1833,10 @@ def understand_data(retrieved_data: dict, plan: dict) -> str:
                           f"  File: {os.path.basename(fpath)}, Rows: {len(gdf)}, CRS: {gdf.crs}", f"  Columns: {list(gdf.columns)}"]
         except Exception as e:
             lines.append(f"\n[uploaded_{ftype}] Could not read: {e}")
-    return "\n".join(lines) if len(lines) > 1 else ""
+    result = "\n".join(lines) if len(lines) > 1 else ""
+    if state_block and result:
+        return state_block + "\n\n" + result
+    return state_block or result
 
 
 def refine_and_plan(task: str, data_schema: dict, plan: dict) -> tuple:
@@ -1603,34 +1969,27 @@ Per-capita instructions:
         fp = src_val.get("file_path") if isinstance(src_val, dict) else None
         if fp:
             path_lines.append(f"  {src_key}: {fp}")
+    for _uf in plan.get("upload_files", []):
+        _ufp = _uf.get("file_path", "")
+        if _ufp and os.path.exists(_ufp):
+            path_lines.append(f"  uploaded_{_uf.get('type', 'file')}: {_ufp}")
     if path_lines:
         multi_source_hint = "ACTUAL FILE PATHS (use EXACTLY, do NOT re-fetch from OSMnx):\n" + "\n".join(
             path_lines) + "\n"
 
     if "osm_boundaries" in data_schema and "osm_roads" in data_schema:
-        b_path = data_schema["osm_boundaries"].get("file_path", "")
-        r_path = data_schema["osm_roads"].get("file_path", "")
-        multi_source_hint += f"Task: road density. sjoin edges to wards. road_density=km/area_km2. Auto-detect UTM."
+        multi_source_hint += "Task: road density. sjoin edges to wards. road_density=km/area_km2. Auto-detect UTM."
     elif "osm_boundaries" in data_schema and "osm_hospitals" in data_schema:
-        b_path = data_schema["osm_boundaries"].get("file_path", "")
-        h_path = data_schema["osm_hospitals"].get("file_path", "")
-        multi_source_hint += f"Task: hospital density. Centroids. sjoin. count/area_km2. Auto-detect UTM."
+        multi_source_hint += "Task: hospital density. Centroids. sjoin. count/area_km2. Auto-detect UTM."
     elif "osm_boundaries" in data_schema and ("osm_greenspace" in data_schema or "osm_parks" in data_schema):
-        b_path = data_schema["osm_boundaries"].get("file_path", "")
-        p_path = data_schema.get("osm_greenspace", data_schema.get(
-            "osm_parks", {})).get("file_path", "")
-        multi_source_hint += f"Task: greenspace. ONE ROW PER WARD. gpd.overlay intersection. groupby ward_name. Auto-detect UTM."
+        multi_source_hint += "Task: greenspace. ONE ROW PER WARD. gpd.overlay intersection. groupby ward_name. Auto-detect UTM."
     elif "osm_boundaries" in data_schema and "osm_water" in data_schema:
-        b_path = data_schema["osm_boundaries"].get("file_path", "")
-        w_path = data_schema["osm_water"].get("file_path", "")
-        multi_source_hint += f"Task: flood risk. Buffer water 300m. flood_ratio=flood_area/ward_area. Auto-detect UTM."
+        multi_source_hint += "Task: flood risk. Buffer water 300m. flood_ratio=flood_area/ward_area. Auto-detect UTM."
     elif "osm_boundaries" in data_schema and "osm_schools" in data_schema:
-        b_path = data_schema["osm_boundaries"].get("file_path", "")
-        s_path = data_schema["osm_schools"].get("file_path", "")
-        multi_source_hint += f"Task: school density. Centroids. sjoin. count per ward. Auto-detect UTM."
+        multi_source_hint += "Task: school density. Centroids. sjoin. count per ward. Auto-detect UTM."
     rag_context = retrieve_relevant_docs(task)
     rag_section = f"\nRelevant tool documentation:\n{rag_context}\n" if rag_context else ""
-    data_overview_section = f"\n{data_overview[:1000]}\n" if data_overview else ""
+    data_overview_section = f"\n{data_overview[:3000]}\n" if data_overview else ""
     hint_config = plan.get("_hint_config", {})
     hint_config_section = f"\nExpert hint config:\n{json.dumps(hint_config, indent=2)}\n" if hint_config else ""
     # GTChain Feature #2: formal tool description templates
@@ -1649,6 +2008,9 @@ Data: {schema_text}
 Rules:
 - global result as FIRST line inside run_analysis()
 - NEVER guess column names — detect dynamically using next((c for c in df.columns if ...), df.columns[0])
+- CRITICAL: NEVER use gdf['name'] directly — always use: name_col = next((c for c in gdf.columns if c.lower() in ['name','ward_name','ward_full','label','title','name:en','area_name','localname']), gdf.columns[0]); gdf['ward_name'] = gdf[name_col]
+- METRIC CHOICE: if the task says "per ward"/"by ward"/"count"/"number of" WITHOUT "density" or "per km" or "per sq", the metric is an INTEGER COUNT of features per ward (.size() after sjoin), NOT a density. Only compute density (count/area_km2) when the task explicitly mentions density/per km²/per sq km.
+- After computing the per-ward metric, NEVER leave it as NaN — fillna(0) and cast counts with .astype(int).
 - result = final_geodataframe (no return)
 - Last line: run_analysis()
 - Auto-detect UTM: cx=wards.to_crs('EPSG:4326').geometry.unary_union.centroid.x; cy=wards.to_crs('EPSG:4326').geometry.unary_union.centroid.y; zone=int((cx+180)/6)+1; UTM=f'EPSG:{{32600+zone if cy>=0 else 32700+zone}}'
@@ -1670,12 +2032,103 @@ Return only Python code."""
     return code
 
 
+# ── Multi-GeoJSON combination ─────────────────────────────────────────────────
+
+def run_multi_geojson_analysis(task: str, plan: dict) -> dict:
+    """Combines 2+ uploaded GeoJSON files. Inspects every file, hands the LLM
+    all paths + schemas, and lets it write the combining code dynamically.
+    No hardcoded chains — the LLM decides the spatial operation."""
+    upload_files = plan.get("upload_files", [])
+    geo_files = [f for f in upload_files if f.get("type") == "geojson"
+                 and f.get("file_path") and os.path.exists(f["file_path"])]
+    if len(geo_files) < 2:
+        return {"success": False, "error": "Fewer than 2 readable GeoJSON uploads"}
+    import geopandas as gpd
+    file_infos = []
+    for f in geo_files:
+        fp = f["file_path"]
+        try:
+            gdf = gpd.read_file(fp)
+            geom_types = gdf.geometry.geom_type.unique().tolist()
+            poly_ratio = float(gdf.geometry.geom_type.isin(
+                ['Polygon', 'MultiPolygon']).mean())
+            file_infos.append({
+                "path": fp, "rows": len(gdf), "crs": str(gdf.crs),
+                "columns": list(gdf.columns), "geom_types": geom_types,
+                "poly_ratio": round(poly_ratio, 2),
+            })
+        except Exception as e:
+            print(f"[Analysis] Multi-GeoJSON: skipping unreadable {fp}: {e}")
+    if len(file_infos) < 2:
+        return {"success": False, "error": "Fewer than 2 readable GeoJSON uploads"}
+    # Highest polygon ratio = likely boundary/aggregation layer
+    boundary = max(file_infos, key=lambda x: (x["poly_ratio"], -x["rows"]))
+    schema_text = "\n".join(
+        f"- {i['path']} | rows={i['rows']} | crs={i['crs']} | geoms={i['geom_types']} | cols={i['columns'][:15]}"
+        for i in file_infos)
+    guidance = load_guidance()
+    ascending = _hint_ascending(plan, any(x in task.lower() for x in [
+        'lowest', 'least', 'minimum', 'fewest', 'poorest', 'worst']))
+    prompt = f"""Write Python GeoPandas code that COMBINES ALL of these uploaded GeoJSON files to answer the task.
+Task: "{task}"
+Uploaded files (use ALL of them, load with gpd.read_file using these EXACT paths):
+{schema_text}
+Likely boundary/aggregation layer (highest polygon ratio): {boundary['path']}
+{guidance}
+Rules:
+- global result as FIRST line inside run_analysis(); last line calls run_analysis()
+- Load EVERY file listed above; set_crs('EPSG:4326') if crs is None, else to_crs('EPSG:4326')
+- make_valid() on all geometries; detect name column dynamically: next((c for c in gdf.columns if c.lower() in ['name','ward','ward_name','label','title','area_name']), gdf.columns[0])
+- Auto-detect UTM: cx=gdf.to_crs('EPSG:4326').geometry.unary_union.centroid.x; cy=gdf.to_crs('EPSG:4326').geometry.unary_union.centroid.y; zone=int((cx+180)/6)+1; UTM=f'EPSG:{{32600+zone if cy>=0 else 32700+zone}}'
+- Buffer/area/length calcs in UTM; predicate= in sjoin; drop geometry before groupby
+- Aggregate per boundary feature: result columns rank(int), ward_name(str), metric(float), geometry(EPSG:4326)
+- sort_values(ascending={ascending}); rank = range(1, len(result)+1)
+Return only Python code."""
+    code = smart_chat(GIS_EXPERT_SYSTEM_PROMPT, prompt, use_groq=True)
+    code = code.replace("```python", "").replace("```", "").replace(
+        "~~~python", "").replace("~~~", "").strip()
+    if code.startswith("python\n") or code.startswith("python "):
+        code = code[6:].strip()
+    print(f"[Analysis] Multi-GeoJSON: combining {len(file_infos)} files...")
+    sandbox_result = run_code_in_sandbox(code, timeout=600)
+    if sandbox_result["success"]:
+        validation = validate_analysis_output(sandbox_result["output"], task)
+        if validation["valid"]:
+            print("[Analysis] Multi-GeoJSON combination succeeded")
+            return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
+        error = validation["error"]
+    else:
+        error = sandbox_result["error"]
+    fix_prompt = f"""The combining code failed. Fix it.
+Task: "{task}"
+Files (load ALL with these EXACT paths): {[i['path'] for i in file_infos]}
+Error: {error[:400]}
+Same rules: global result first line inside run_analysis(), result = final GeoDataFrame with rank/ward_name/metric/geometry in EPSG:4326, run_analysis() as last line.
+Return only Python code."""
+    code = smart_chat(GIS_EXPERT_SYSTEM_PROMPT, fix_prompt, use_groq=True)
+    code = code.replace("```python", "").replace("```", "").replace(
+        "~~~python", "").replace("~~~", "").strip()
+    if code.startswith("python\n") or code.startswith("python "):
+        code = code[6:].strip()
+    sandbox_result = run_code_in_sandbox(code, timeout=600)
+    if sandbox_result["success"]:
+        validation = validate_analysis_output(sandbox_result["output"], task)
+        if validation["valid"]:
+            print("[Analysis] Multi-GeoJSON combination succeeded on retry")
+            return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 2}
+        error = validation["error"]
+    else:
+        error = sandbox_result["error"]
+    return {"success": False, "error": error}
+
+
 # ── Multi-file spatial join ───────────────────────────────────────────────────
 
 def run_multi_file_analysis(task: str, plan: dict) -> dict:
     upload_files = plan.get("upload_files", [])
-    geojson_file = next((f for f in reversed(upload_files)
-                        if f["type"] == "geojson"), None)
+    _bnd = _uploaded_boundary(plan)
+    geojson_file = next((f for f in upload_files if f.get("file_path") == _bnd), None) \
+        or next((f for f in reversed(upload_files) if f["type"] == "geojson"), None)
     csv_file = next((f for f in upload_files if f["type"] == "csv"), None)
     if not geojson_file or not csv_file:
         return {"success": False, "error": "Need both a GeoJSON boundary file and a CSV data file"}
@@ -1706,9 +2159,11 @@ def run_multi_file_analysis(task: str, plan: dict) -> dict:
         return {"success": False, "error": f"Could not inspect uploaded files: {e}"}
     if not lat_col or not lon_col:
         return {"success": False, "error": f"CSV has no lat/lon columns. Found: {csv_cols}"}
-    ascending = any(x in task.lower() for x in [
-                    'lowest', 'least', 'minimum', 'fewest', 'poorest', 'worst'])
-    pop_col_str = ward_pop_col or "population"
+    ward_name_col, lat_col, lon_col = _sq(
+        ward_name_col), _sq(lat_col), _sq(lon_col)
+    ascending = _hint_ascending(plan, any(x in task.lower() for x in [
+        'lowest', 'least', 'minimum', 'fewest', 'poorest', 'worst']))
+    pop_col_str = _sq(ward_pop_col) if ward_pop_col else "population"
     code = f"""
 import geopandas as gpd, pandas as pd
 from shapely.geometry import Point
@@ -1726,32 +2181,41 @@ def run_analysis():
     df['{lat_col}'] = pd.to_numeric(df['{lat_col}'], errors='coerce')
     df['{lon_col}'] = pd.to_numeric(df['{lon_col}'], errors='coerce')
     df = df.dropna(subset=['{lat_col}','{lon_col}'])
-    df['geometry'] = df.apply(lambda r: Point(r['{lon_col}'], r['{lat_col}']), axis=1)
+    df['geometry'] = df.apply(lambda r: Point(
+        r['{lon_col}'], r['{lat_col}']), axis=1)
     points = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
-    joined = gpd.sjoin(points, wards[['geometry','{ward_name_col}']], how='left', predicate='within')
-    counts = joined.groupby('{ward_name_col}').size().reset_index(name='point_count')
+    joined = gpd.sjoin(
+        points, wards[['geometry','{ward_name_col}']], how='left', predicate='within')
+    counts = joined.groupby('{ward_name_col}').size(
+    ).reset_index(name='point_count')
     merged = wards.merge(counts, on='{ward_name_col}', how='left')
     merged['point_count'] = merged['point_count'].fillna(0).astype(int)
-    merged['ward_name']   = merged['{ward_name_col}'].fillna('Unknown').astype(str).str.strip()
+    merged['ward_name']   = merged['{ward_name_col}'].fillna(
+        'Unknown').astype(str).str.strip()
     if '{pop_col_str}' in merged.columns:
-        merged['population']     = pd.to_numeric(merged['{pop_col_str}'], errors='coerce').fillna(1)
-        merged['count_per_100k'] = (merged['point_count'] / merged['population'] * 100000).round(2)
+        merged['population']     = pd.to_numeric(
+            merged['{pop_col_str}'], errors='coerce').fillna(1)
+        merged['count_per_100k'] = (
+            merged['point_count'] / merged['population'] * 100000).round(2)
         sort_col = 'count_per_100k'
     else:
         merged['population']     = 1
         merged['count_per_100k'] = merged['point_count'].astype(float)
         sort_col = 'point_count'
-    merged = merged.sort_values(sort_col, ascending={str(ascending)}).reset_index(drop=True)
+    merged = merged.sort_values(
+        sort_col, ascending={ascending}).reset_index(drop=True)
     merged['rank'] = range(1, len(merged) + 1)
-    keep   = ['rank','ward_name','point_count','count_per_100k','population','geometry']
-    result = merged[[c for c in keep if c in merged.columns]].to_crs('EPSG:4326').reset_index(drop=True)
+    keep   = ['rank','ward_name','point_count',
+        'count_per_100k','population','geometry']
+    result = merged[[c for c in keep if c in merged.columns]].to_crs(
+        'EPSG:4326').reset_index(drop=True)
 
 run_analysis()
 """
     print("[Analysis] Running multi-file spatial join...")
     sandbox_result = run_code_in_sandbox(code)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Multi-file spatial join succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -1782,16 +2246,24 @@ def run_uploaded_file_analysis(task: str, plan: dict) -> dict:
         return {"success": False, "error": f"Could not read uploaded file: {e}"}
     guidance = load_guidance()
     lat_col = next((c for c in columns if c.lower()
-                   in ['latitude', 'lat']), None)
+                    in ['latitude', 'lat']), None)
     lon_col = next((c for c in columns if c.lower() in [
-                   'longitude', 'lon', 'lng']), None)
+        'longitude', 'lon', 'lng']), None)
     geo_hint = f'Coordinates: lat="{lat_col}", lon="{lon_col}"' if lat_col and lon_col else ""
     group_candidates = ['Ward', 'ward', 'District', 'district', 'Area',
                         'area', 'Region', 'region', 'City', 'city', 'State', 'state']
     group_col = next((c for c in group_candidates if c in columns), columns[0])
-    prompt = f"""Write Python code to analyse this uploaded {file_type} file.
-Task: "{task}", File: "{upload_path}", Columns: {columns}, {geo_hint}
-{guidance}
+    _all_files_lines = []
+    for _f in plan.get("upload_files", []):
+        _afp = _f.get("file_path", "")
+        if _afp and os.path.exists(_afp):
+            _all_files_lines.append(
+                f"  - {_afp} ({_f.get('type', 'file')}, {_f.get('rows', '?')} rows, cols: {_f.get('columns', [])[:12]})")
+    _all_files_section = ("ALL uploaded files (load and use EVERY file relevant to the task):\n"
+                          + "\n".join(_all_files_lines) + "\n") if _all_files_lines else ""
+    prompt = f"""Write Python code to analyse the user's uploaded data.
+Task: "{task}", Primary file: "{upload_path}", Columns: {columns}, {geo_hint}
+{_all_files_section}{guidance}
 Group by "{group_col}", count/aggregate, result['ward_name']={group_col}, sort+rank.
 Store as GeoDataFrame in global result (EPSG:4326). global result inside run_analysis(). Last line calls run_analysis().
 Return only Python code."""
@@ -1800,7 +2272,7 @@ Return only Python code."""
         "~~~python", "").replace("~~~", "").strip()
     sandbox_result = run_code_in_sandbox(code)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Single file analysis succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -1813,7 +2285,7 @@ Return only Python code."""
         "~~~python", "").replace("~~~", "").strip()
     sandbox_result = run_code_in_sandbox(code)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Single file analysis succeeded on retry")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 2}
@@ -1821,7 +2293,8 @@ Return only Python code."""
 
 
 def patch_result_assignment(code: str) -> str:
-    if "result" in code:
+    import re as _re
+    if _re.search(r'^\s*(global\s+result|result\s*=)', code, _re.MULTILINE):
         return code
     lines = code.strip().splitlines()
     last_gdf_var = None
@@ -1837,7 +2310,7 @@ def patch_result_assignment(code: str) -> str:
 # ── Hybrid Upload + OSM ───────────────────────────────────────────────────────
 
 def run_hybrid_upload_osm_analysis(task: str, plan: dict) -> dict:
-    upload_path = plan.get("upload_path", "")
+    upload_path = _uploaded_boundary(plan) or plan.get("upload_path", "")
     if not upload_path or not os.path.exists(upload_path):
         return {"success": False, "error": "No uploaded boundary file"}
     task_lower = task.lower()
@@ -1848,8 +2321,8 @@ def run_hybrid_upload_osm_analysis(task: str, plan: dict) -> dict:
     else:
         return {"success": False, "error": "Hybrid path: task type not detected"}
     city = plan.get("city", "")
-    ascending = any(x in task_lower for x in [
-                    "least", "lowest", "fewest", "worst", "minimum", "poorest"])
+    ascending = _hint_ascending(plan, any(x in task_lower for x in [
+        "least", "lowest", "fewest", "worst", "minimum", "poorest"]))
     print(f"[Analysis] Hybrid Upload+OSM: {osm_type} density for {city}")
     code = f"""
 import geopandas as gpd, pandas as pd, osmnx as ox
@@ -1869,13 +2342,17 @@ def run_analysis():
     wards['geometry'] = wards['geometry'].apply(make_valid)
     if wards.crs is None: wards = wards.set_crs(WGS84)
     elif str(wards.crs) != 'EPSG:4326': wards = wards.to_crs(WGS84)
-    name_col_candidates = ['name','ward','ward_name','label','title','area_name','name_en','localname','neighbourhood','district']
-    name_col = next((c for c in wards.columns if c.lower() in [x.lower() for x in name_col_candidates]), wards.columns[0])
-    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
+    name_col_candidates = ['name','ward','ward_name','label','title',
+        'area_name','name_en','localname','neighbourhood','district']
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    x.lower() for x in name_col_candidates]), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
     bounds = wards.total_bounds
     bbox_north, bbox_south, bbox_east, bbox_west = bounds[3], bounds[1], bounds[2], bounds[0]
     try:
-        points = _ffb(bbox_north, bbox_south, bbox_east, bbox_west, tags).reset_index()
+        points = _ffb(bbox_north, bbox_south, bbox_east,
+                      bbox_west, tags).reset_index()
     except Exception as e:
         print(f"bbox fetch failed: {{e}}"); result = gpd.GeoDataFrame(); return
     if len(points) == 0: result = gpd.GeoDataFrame(); return
@@ -1887,25 +2364,31 @@ def run_analysis():
     UTM  = f'EPSG:{{32600 + zone if cy >= 0 else 32700 + zone}}'
     wards_utm  = wards.to_crs(UTM).copy()
     points_utm = points.to_crs(UTM).copy()
-    points_utm['geometry'] = points_utm.geometry.apply(lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
+    points_utm['geometry'] = points_utm.geometry.apply(
+        lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
     wards_utm['area_km2']  = (wards_utm.geometry.area / 1e6).round(3)
-    joined = gpd.sjoin(points_utm[['geometry']], wards_utm[['geometry','ward_name','area_km2']], how='left', predicate='intersects')
+    joined = gpd.sjoin(points_utm[['geometry']], wards_utm[[
+                       'geometry','ward_name','area_km2']], how='left', predicate='intersects')
     joined = joined.drop(columns='geometry')
     counts = joined.groupby('ward_name').size().reset_index(name='{count_col}')
     merged = wards_utm.merge(counts, on='ward_name', how='left')
     merged['{count_col}'] = merged['{count_col}'].fillna(0).astype(int)
-    merged['{metric}']    = (merged['{count_col}'] / merged['area_km2'].replace(0, float('nan'))).round(4).fillna(0)
-    merged = merged.sort_values('{metric}', ascending={str(ascending)}).reset_index(drop=True)
+    merged['{metric}']    = (
+        merged['{count_col}'] / merged['area_km2'].replace(0, float('nan'))).round(4).fillna(0)
+    merged = merged.sort_values('{count_col}', ascending={ascending}).reset_index(drop=True)
     merged['rank'] = range(1, len(merged) + 1)
-    keep   = ['rank','ward_name','{count_col}','{metric}','area_km2','geometry']
-    result = merged[[c for c in keep if c in merged.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    keep   = ['rank','ward_name','{count_col}',
+        '{metric}','area_km2','geometry']
+    result = merged[[c for c in keep if c in merged.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
     sandbox_result = run_code_in_sandbox(code, timeout=120)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Hybrid Upload+OSM succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -1923,14 +2406,15 @@ def run_point_density_analysis(task: str, plan: dict, retrieved_data: dict,
     p_path = retrieved_data.get(source_key, {}).get("file_path")
     if not b_path or not p_path:
         return {"success": False, "error": f"Missing file paths for boundaries or {source_key}"}
-    city = plan.get("city", "")
-    ascending = any(x in task.lower() for x in [
-                    "least", "lowest", "fewest", "worst", "minimum", "poorest"])
+    city = _sq(plan.get("city", ""))
+    ascending = _hint_ascending(plan, any(x in task.lower() for x in [
+        "least", "lowest", "fewest", "worst", "minimum", "poorest"]))
     try:
         import geopandas as _gpd
         utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
     except Exception:
         utm_epsg = 'EPSG:32643'
+    utm_epsg = _hint_utm(plan, utm_epsg)
     code = f"""
 import geopandas as gpd, pandas as pd
 from shapely.validation import make_valid
@@ -1947,33 +2431,44 @@ def run_analysis():
     else:                  wards  = wards.to_crs(WGS84)
     if points.crs is None: points = points.set_crs(WGS84)
     else:                  points = points.to_crs(WGS84)
-    name_col = next((c for c in wards.columns if c.lower() in ['ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
-    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
     wards_utm  = wards.to_crs(UTM).copy()
     points_utm = points.to_crs(UTM).copy()
-    points_utm['geometry'] = points_utm.geometry.apply(lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
+    points_utm['geometry'] = points_utm.geometry.apply(
+        lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
     wards_utm['area_km2']  = (wards_utm.geometry.area / 1e6).round(3)
-    joined = gpd.sjoin(points_utm[['geometry']], wards_utm[['geometry','ward_name','area_km2']], how='left', predicate='intersects')
+    joined = gpd.sjoin(points_utm[['geometry']], wards_utm[[
+                       'geometry','ward_name','area_km2']], how='left', predicate='intersects')
     joined = joined.drop(columns='geometry')
-    counts = joined.groupby('ward_name').size().reset_index(name='{count_name}')
+    counts = joined.groupby('ward_name').size(
+    ).reset_index(name='{count_name}')
     merged = wards_utm.merge(counts, on='ward_name', how='left')
     merged['{count_name}']  = merged['{count_name}'].fillna(0).astype(int)
-    merged['{metric_name}'] = (merged['{count_name}'] / merged['area_km2'].replace(0, float('nan'))).round(4).fillna(0)
-    ascending = {str(ascending)}
+    merged['{metric_name}'] = (
+        merged['{count_name}'] / merged['area_km2'].replace(0, float('nan'))).round(4).fillna(0)
+    ascending = {ascending}
     merged = merged.drop_duplicates(subset='ward_name', keep='first')
-    merged = merged[merged['ward_name'].str.lower().str.strip() != '{city}'.lower().strip()]
+    merged = merged[merged['ward_name'].str.lower().str.strip()
+                                                  != '{city}'.lower().strip()]
     merged = merged[merged['ward_name'].str.lower().str.strip() != '']
-    merged = merged.sort_values('{metric_name}', ascending=ascending).reset_index(drop=True)
+    merged = merged.sort_values(
+        '{metric_name}', ascending=ascending).reset_index(drop=True)
     merged['rank'] = range(1, len(merged) + 1)
-    keep = ['rank','ward_name','{count_name}','{metric_name}','area_km2','geometry']
-    result = merged[[c for c in keep if c in merged.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    keep = ['rank','ward_name','{count_name}',
+        '{metric_name}','area_km2','geometry']
+    result = merged[[c for c in keep if c in merged.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
     sandbox_result = run_code_in_sandbox(code, timeout=300)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print(f"[Analysis] {metric_name} succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -1989,14 +2484,15 @@ def run_linear_density_analysis(task: str, plan: dict, retrieved_data: dict,
     l_path = retrieved_data.get(source_key, {}).get("file_path")
     if not b_path or not l_path:
         return {"success": False, "error": f"Missing file paths for boundaries or {source_key}"}
-    city = plan.get("city", "")
-    ascending = any(x in task.lower() for x in [
-                    "least", "lowest", "fewest", "worst", "minimum", "poorest"])
+    city = _sq(plan.get("city", ""))
+    ascending = _hint_ascending(plan, any(x in task.lower() for x in [
+        "least", "lowest", "fewest", "worst", "minimum", "poorest"]))
     try:
         import geopandas as _gpd
         utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
     except Exception:
         utm_epsg = 'EPSG:32643'
+    utm_epsg = _hint_utm(plan, utm_epsg)
     code = f"""
 import geopandas as gpd, pandas as pd
 from shapely.validation import make_valid
@@ -2005,42 +2501,52 @@ import warnings; warnings.filterwarnings('ignore')
 def run_analysis():
     global result
     UTM, WGS84 = '{utm_epsg}', 'EPSG:4326'
-    wards = gpd.read_file('{b_path}')
-    lines = gpd.read_file('{l_path}')
+    wards  = gpd.read_file('{b_path}')
+    points = gpd.read_file('{p_path}')
     wards['geometry'] = wards['geometry'].apply(make_valid)
     lines['geometry'] = lines['geometry'].apply(make_valid)
     if wards.crs is None: wards = wards.set_crs(WGS84)
     else:                 wards = wards.to_crs(WGS84)
     if lines.crs is None: lines = lines.set_crs(WGS84)
     else:                 lines = lines.to_crs(WGS84)
-    name_col = next((c for c in wards.columns if c.lower() in ['ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
-    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
     wards_utm = wards.to_crs(UTM).copy()
     lines_utm = lines.to_crs(UTM).copy()
     wards_utm['area_km2'] = (wards_utm.geometry.area / 1e6).round(3)
     lines_utm['length_m'] = lines_utm.geometry.length
-    joined = gpd.sjoin(lines_utm[['geometry','length_m']], wards_utm[['geometry','ward_name','area_km2']], how='left', predicate='intersects')
+    joined = gpd.sjoin(lines_utm[['geometry','length_m']], wards_utm[[
+                       'geometry','ward_name','area_km2']], how='left', predicate='intersects')
     joined = joined.drop(columns='geometry')
     lengths = joined.groupby('ward_name')['length_m'].sum().reset_index()
     lengths['{length_name}'] = (lengths['length_m'] / 1000).round(3)
-    merged = wards_utm.merge(lengths[['ward_name','{length_name}']], on='ward_name', how='left')
+    merged = wards_utm.merge(
+        lengths[['ward_name','{length_name}']], on='ward_name', how='left')
     merged['{length_name}'] = merged['{length_name}'].fillna(0)
-    merged['{metric_name}'] = (merged['{length_name}'] / merged['area_km2'].replace(0, float('nan'))).round(3).fillna(0)
-    ascending = {str(ascending)}
+    merged['{metric_name}'] = (
+        merged['{length_name}'] / merged['area_km2'].replace(0, float('nan'))).round(3).fillna(0)
+    ascending = {ascending}
     merged = merged.drop_duplicates(subset='ward_name', keep='first')
-    merged = merged[merged['ward_name'].str.lower().str.strip() != '{city}'.lower().strip()]
+    merged = merged[merged['ward_name'].str.lower().str.strip()
+                                                  != '{city}'.lower().strip()]
     merged = merged[merged['ward_name'].str.lower().str.strip() != '']
-    merged = merged.sort_values('{metric_name}', ascending=ascending).reset_index(drop=True)
+    merged = merged.sort_values(
+        '{metric_name}', ascending=ascending).reset_index(drop=True)
     merged['rank'] = range(1, len(merged) + 1)
-    keep = ['rank','ward_name','{length_name}','{metric_name}','area_km2','geometry']
-    result = merged[[c for c in keep if c in merged.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+    keep = ['rank','ward_name','{length_name}',
+        '{metric_name}','area_km2','geometry']
+    result = merged[[c for c in keep if c in merged.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
 
 run_analysis()
 """
     sandbox_result = run_code_in_sandbox(code, timeout=600)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print(f"[Analysis] {metric_name} succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -2052,21 +2558,56 @@ run_analysis()
 
 # ── WorldPop raster management ────────────────────────────────────────────────
 
+# ISO2 → ISO3 for Nominatim country_code resolution of cities not in CITY_ISO3
+_ISO2_TO_ISO3 = {
+    'in': 'IND', 'gb': 'GBR', 'de': 'DEU', 'fr': 'FRA', 'nl': 'NLD',
+    'es': 'ESP', 'it': 'ITA', 'at': 'AUT', 'ch': 'CHE', 'be': 'BEL',
+    'se': 'SWE', 'no': 'NOR', 'dk': 'DNK', 'pl': 'POL', 'cz': 'CZE',
+    'hu': 'HUN', 'pt': 'PRT', 'gr': 'GRC', 'ie': 'IRL', 'fi': 'FIN',
+    'ro': 'ROU', 'hr': 'HRV', 'sg': 'SGP', 'jp': 'JPN', 'kr': 'KOR',
+    'th': 'THA', 'id': 'IDN', 'my': 'MYS', 'ph': 'PHL', 'vn': 'VNM',
+    'cn': 'CHN', 'tw': 'TWN', 'hk': 'HKG', 'bd': 'BGD', 'pk': 'PAK',
+    'lk': 'LKA', 'np': 'NPL', 'ae': 'ARE', 'tr': 'TUR', 'sa': 'SAU',
+    'eg': 'EGY', 'ir': 'IRN', 'iq': 'IRQ', 'il': 'ISR', 'jo': 'JOR',
+    'ng': 'NGA', 'ke': 'KEN', 'za': 'ZAF', 'gh': 'GHA', 'tz': 'TZA',
+    'et': 'ETH', 'ma': 'MAR', 'tn': 'TUN', 'dz': 'DZA', 'ug': 'UGA',
+    'us': 'USA', 'ca': 'CAN', 'br': 'BRA', 'ar': 'ARG', 'mx': 'MEX',
+    'co': 'COL', 'pe': 'PER', 'cl': 'CHL', 've': 'VEN', 'ec': 'ECU',
+    'au': 'AUS', 'nz': 'NZL', 'ru': 'RUS', 'ua': 'UKR',
+}
+
+
+def _resolve_iso3(city_lower: str) -> str:
+    """Resolve city → ISO3. CITY_ISO3 dict first, then Nominatim country_code.
+    Falls back to IND only if both fail."""
+    iso3 = CITY_ISO3.get(city_lower)
+    if iso3:
+        return iso3
+    try:
+        import requests as _req
+        nom = _req.get('https://nominatim.openstreetmap.org/search',
+                       params={'q': city_lower, 'format': 'json',
+                               'limit': 1, 'addressdetails': 1},
+                       headers={'User-Agent': 'GoAI/1.0'}, timeout=10).json()
+        if nom:
+            cc = nom[0].get('address', {}).get('country_code', '').lower()
+            iso3 = _ISO2_TO_ISO3.get(cc)
+            if iso3:
+                print(
+                    f"[WorldPop] Resolved '{city_lower}' → {iso3} via Nominatim")
+                return iso3
+            print(
+                f"[WorldPop] Unmapped country_code '{cc}' for '{city_lower}', fallback IND")
+    except Exception as e:
+        print(f"[WorldPop] Nominatim resolve failed ({e}), fallback IND")
+    return 'IND'
+
+
 def ensure_worldpop_raster(city: str) -> str:
     """Downloads WorldPop raster. Uses module-level CITY_ISO3 — single source of truth."""
     import requests as _req
     city_lower = city.lower().split(",")[0].strip()
-    iso3 = CITY_ISO3.get(city_lower, None)
-    if iso3 is None:
-        try:
-            nom = _req.get(f'https://nominatim.openstreetmap.org/search?q={city_lower}&format=json&limit=1',
-                           headers={'User-Agent': 'GoAI/1.0'}, timeout=10).json()
-            iso3 = 'IND'
-            if nom:
-                print(
-                    f"[WorldPop] Unknown city '{city_lower}', using fallback ISO3=IND")
-        except Exception:
-            iso3 = 'IND'
+    iso3 = _resolve_iso3(city_lower)
     try:
         r = _req.get(
             f'https://hub.worldpop.org/rest/data/pop/wpgp?iso3={iso3}', timeout=30)
@@ -2118,19 +2659,7 @@ def run_per_capita_analysis(task: str, plan: dict, retrieved_data: dict) -> dict
         # FIX Bug 1: else: properly indented and present
         city_name = plan.get("city", "")
         city_lower = city_name.lower().split(",")[0].strip()
-        # FIX Bug 3: module-level CITY_ISO3
-        iso3 = CITY_ISO3.get(city_lower, None)
-        if iso3 is None:
-            try:
-                import requests as _req2
-                nom = _req2.get(f'https://nominatim.openstreetmap.org/search?q={city_lower}&format=json&limit=1',
-                                headers={'User-Agent': 'GoAI/1.0'}, timeout=10).json()
-                iso3 = 'IND'
-                if nom:
-                    print(
-                        f"[Analysis] Unknown city '{city_lower}', using fallback ISO3=IND")
-            except Exception:
-                iso3 = 'IND'
+        iso3 = _resolve_iso3(city_lower)
         import requests as _req
         try:
             r = _req.get(
@@ -2176,7 +2705,7 @@ def run_per_capita_analysis(task: str, plan: dict, retrieved_data: dict) -> dict
         try:
             city_name2 = plan.get("city", "")
             city_lower2 = city_name2.lower().split(",")[0].strip()
-            iso3_retry = CITY_ISO3.get(city_lower2, 'IND')
+            iso3_retry = _resolve_iso3(city_lower2)
             r2 = _req_retry.get(
                 f'https://hub.worldpop.org/rest/data/pop/wpgp?iso3={iso3_retry}', timeout=30)
             data2 = r2.json()['data']
@@ -2201,6 +2730,7 @@ def run_per_capita_analysis(task: str, plan: dict, retrieved_data: dict) -> dict
         utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
     except Exception:
         utm_epsg = 'EPSG:32643'
+    utm_epsg = _hint_utm(plan, utm_epsg)
 
     task_lower = task.lower()
 
@@ -2212,7 +2742,7 @@ def run_per_capita_analysis(task: str, plan: dict, retrieved_data: dict) -> dict
 
     # Detect which OSM layer to use; inline_fetch is used when pre-fetch failed
     inline_fetch = ""
-    city_for_fetch = plan.get("city", "Mumbai")
+    city_for_fetch = _sq(plan.get("city", "Mumbai"))
 
     if _fp("osm_hospitals"):
         osm_path, count_col = _fp("osm_hospitals"), "hospital_count"
@@ -2226,16 +2756,16 @@ def run_per_capita_analysis(task: str, plan: dict, retrieved_data: dict) -> dict
 import osmnx as ox
 _hosp_tags = {{'amenity': ['hospital', 'clinic', 'doctors']}}
 try:
-    _hosp = ox.features_from_place('{city_for_fetch}', _hosp_tags).reset_index()
+    _hosp = ox.features_from_place(
+        '{city_for_fetch}', _hosp_tags).reset_index()
     _hosp['geometry'] = _hosp['geometry'].apply(make_valid)
     _hosp = _hosp.to_crs('EPSG:4326')
     _hosp.to_file('{osm_path}', driver='GeoJSON')
     print(f"Inline hospital fetch: {{len(_hosp)}} features")
 except Exception as _e:
     print(f"Inline hospital fetch failed: {{_e}}")
-    import geopandas as _gpd; import pandas as _pd
-    _hosp = _gpd.GeoDataFrame(_pd.DataFrame(), geometry=[], crs='EPSG:4326')
-    _hosp.to_file('{osm_path}', driver='GeoJSON')
+    with open('{osm_path}', 'w') as _ef:
+        _ef.write('{{"type": "FeatureCollection", "features": []}}')
 """
     elif _fp("osm_schools"):
         osm_path, count_col = _fp("osm_schools"), "school_count"
@@ -2255,8 +2785,8 @@ try:
     print(f"Inline school fetch: {{len(_sch)}} features")
 except Exception as _e:
     print(f"Inline school fetch failed: {{_e}}")
-    import geopandas as _gpd; import pandas as _pd
-    _gpd.GeoDataFrame(_pd.DataFrame(), geometry=[], crs='EPSG:4326').to_file('{osm_path}', driver='GeoJSON')
+    with open('{osm_path}', 'w') as _ef:
+        _ef.write('{{"type": "FeatureCollection", "features": []}}')
 """
     elif _fp("osm_transit"):
         osm_path, count_col = _fp("osm_transit"), "transit_count"
@@ -2273,9 +2803,9 @@ except Exception as _e:
     else:
         return {"success": False, "error": "No OSM layer found for per-capita analysis"}
 
-    city = plan.get("city", "")
-    ascending = any(x in task_lower for x in [
-                    "least", "lowest", "fewest", "worst", "minimum", "poorest"])
+    city = _sq(plan.get("city", ""))
+    ascending = _hint_ascending(plan, any(x in task_lower for x in [
+        "least", "lowest", "fewest", "worst", "minimum", "poorest"]))
 
     code = f"""
 import geopandas as gpd, pandas as pd, rasterio
@@ -2296,65 +2826,89 @@ def run_analysis():
     else:                    wards    = wards.to_crs(WGS84)
     if features.crs is None: features = features.set_crs(WGS84)
     else:                    features = features.to_crs(WGS84)
-    name_col = next((c for c in wards.columns if c.lower() in ['ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
-    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(x, list) else x).fillna('Unknown').astype(str).str.strip()
-    print(f"Computing zonal stats (raster EPSG:{raster_epsg}, UTM:{utm_epsg})...")
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
+    print(
+        f"Computing zonal stats (raster EPSG:{raster_epsg}, UTM:{utm_epsg})...")
     wards_for_stats = wards.to_crs(RASTER_CRS)
-    stats = zonal_stats(wards_for_stats, '{tif_path}', stats=['sum'], nodata=-99999, all_touched=True)
+    stats = zonal_stats(wards_for_stats, '{tif_path}', stats=[
+                        'sum'], nodata=-99999, all_touched=True)
     print(f"Raw stats sample: {{stats[:3]}}")
-    pop_values = [s['sum'] if s is not None and s['sum'] is not None else 0 for s in stats]
+    pop_values = [s['sum'] if s is not None and s['sum']
+        is not None else 0 for s in stats]
     wards['population'] = pop_values
     valid_pop = wards[wards['population'] > 0]['population']
     print(f"Wards with valid population: {{len(valid_pop)}}/{{len(wards)}}")
     if len(valid_pop) == 0:
         print("WARNING: WorldPop no overlap — using area proxy")
         wards_utm_temp = wards.to_crs(UTM)
-        wards['population'] = (wards_utm_temp.geometry.area / 1e4).round(0).astype(int).clip(lower=1)
+        wards['population'] = (
+            wards_utm_temp.geometry.area / 1e4).round(0).astype(int).clip(lower=1)
     else:
-        wards['population'] = wards['population'].clip(lower=1).round(0).astype(int)
-    print(f"Population range: {{wards['population'].min()}} - {{wards['population'].max()}}")
+        wards['population'] = wards['population'].clip(
+            lower=1).round(0).astype(int)
+    print(
+        f"Population range: {{wards['population'].min()}} - {{wards['population'].max()}}")
     wards_utm    = wards.to_crs(UTM).copy()
     features_utm = features.to_crs(UTM).copy()
     wards_utm['ward_area_km2'] = (wards_utm.geometry.area / 1e6).round(3)
     wards_utm['ward_name']     = wards['ward_name'].values
     wards_utm['population']    = wards['population'].values
-    poly_ratio    = features_utm.geometry.geom_type.isin(['Polygon','MultiPolygon']).mean()
+    poly_ratio    = features_utm.geometry.geom_type.isin(
+        ['Polygon','MultiPolygon']).mean()
     is_area_based = poly_ratio > 0.5
-    print(f"Feature type: {{'area' if is_area_based else 'point'}}-based ({{poly_ratio:.0%}} polygons)")
+    print(
+        f"Feature type: {{'area' if is_area_based else 'point'}}-based ({{poly_ratio:.0%}} polygons)")
     if is_area_based:
-        feat_poly   = features_utm[features_utm.geometry.geom_type.isin(['Polygon','MultiPolygon'])].copy()
-        intersected = gpd.overlay(feat_poly[['geometry']], wards_utm[['geometry','ward_name']], how='intersection')
-        intersected['feature_area_km2'] = (intersected.geometry.area / 1e6).round(4)
-        grouped = intersected.groupby('ward_name')['feature_area_km2'].sum().reset_index(name='metric_value')
+        feat_poly   = features_utm[features_utm.geometry.geom_type.isin(
+            ['Polygon','MultiPolygon'])].copy()
+        intersected = gpd.overlay(feat_poly[['geometry']], wards_utm[[
+                                  'geometry','ward_name']], how='intersection')
+        intersected['feature_area_km2'] = (
+            intersected.geometry.area / 1e6).round(4)
+        grouped = intersected.groupby(
+            'ward_name')['feature_area_km2'].sum().reset_index(name='metric_value')
         merged  = wards_utm.merge(grouped, on='ward_name', how='left')
         merged['metric_value'] = merged['metric_value'].fillna(0)
         merged['population']   = merged['population'].fillna(1).astype(int)
     else:
-        features_utm['geometry'] = features_utm.geometry.apply(lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
-        joined = gpd.sjoin(features_utm[['geometry']], wards_utm[['geometry','ward_name','ward_area_km2']], how='left', predicate='intersects')
+        features_utm['geometry'] = features_utm.geometry.apply(
+            lambda g: g.centroid if g.geom_type in ['Polygon','MultiPolygon'] else g)
+        joined = gpd.sjoin(features_utm[['geometry']], wards_utm[[
+                           'geometry','ward_name','ward_area_km2']], how='left', predicate='intersects')
         joined = joined.drop(columns='geometry')
-        counts = joined.groupby('ward_name').size().reset_index(name='metric_value')
+        counts = joined.groupby('ward_name').size(
+        ).reset_index(name='metric_value')
         merged = wards_utm.merge(counts, on='ward_name', how='left')
         merged['metric_value'] = merged['metric_value'].fillna(0).astype(int)
         merged['population']   = merged['population'].fillna(1).astype(int)
-    merged['{rate_col}']  = (merged['metric_value'] / merged['population'] * {rate_factor}).round(2).fillna(0)
+    merged['{rate_col}']  = (
+        merged['metric_value'] / merged['population'] * {rate_factor}).round(2).fillna(0)
     merged['{count_col}'] = merged['metric_value']
-    ascending = {str(ascending)}
+    ascending = {ascending}
     merged = merged.drop_duplicates(subset='ward_name', keep='first')
-    merged = merged[merged['ward_name'].str.lower().str.strip() != '{city}'.lower().strip()]
+    merged = merged[merged['ward_name'].str.lower().str.strip()
+                                                  != '{city}'.lower().strip()]
     merged = merged[merged['ward_name'].str.lower().str.strip() != '']
-    merged = merged.sort_values('{rate_col}', ascending=ascending).reset_index(drop=True)
+    merged = merged.sort_values(
+        '{rate_col}', ascending=ascending).reset_index(drop=True)
     merged['rank'] = range(1, len(merged) + 1)
-    keep = ['rank','ward_name','{count_col}','population','{rate_col}','ward_area_km2','geometry']
-    result = merged[[c for c in keep if c in merged.columns]].to_crs(WGS84).reset_index(drop=True)
-    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
-    print(f"Result: {{len(result)}} wards, top: {{result.iloc[0]['ward_name']}} = {{result.iloc[0]['{rate_col}']}}")
+    keep = ['rank','ward_name','{count_col}','population',
+        '{rate_col}','ward_area_km2','geometry']
+    result = merged[[c for c in keep if c in merged.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
+    print(
+        f"Result: {{len(result)}} wards, top: {{result.iloc[0]['ward_name']}} = {{result.iloc[0]['{rate_col}']}}")
 
 run_analysis()
 """
     sandbox_result = run_code_in_sandbox(code, timeout=600)
     if sandbox_result["success"]:
-        validation = validate_analysis_output(sandbox_result["output"])
+        validation = validate_analysis_output(sandbox_result["output"], task)
         if validation["valid"]:
             print("[Analysis] Per-capita analysis succeeded")
             return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -2365,12 +2919,295 @@ run_analysis()
     return {"success": False, "error": error}
 
 
+def run_uhi_analysis(task: str, plan: dict, retrieved_data: dict, tif_path: str, mode: str = "lst") -> dict:
+    b_path = retrieved_data.get("osm_boundaries", {}).get("file_path")
+    _up_geo = _uploaded_boundary(plan)
+    if _up_geo:
+        b_path = _up_geo
+        print(f"[Analysis] Satellite using UPLOADED boundaries: {_up_geo}")
+    elif "mumbai" in plan.get("city", "").lower():
+        # Consistency: all Mumbai per-ward analyses use the BMC ward file
+        # (same as flood/per-capita), not OSM metro subdistricts
+        b_path = "/data/mumbai_ward_shapefile/Mumbai_wards.geojson"
+        print("[Analysis] Mumbai — using BMC Mumbai_wards.geojson for satellite")
+    if not b_path and "mumbai" in plan.get("city", "").lower():
+        b_path = "/data/mumbai_ward_shapefile/Mumbai_wards.geojson"
+        print(
+            "[Analysis] osm_boundaries missing — using Mumbai_wards.geojson fallback for satellite")
+    if not b_path:
+        return {"success": False, "error": "Missing boundary file for satellite analysis"}
+    city = _sq(plan.get("city", ""))
+    ascending = _hint_ascending(plan, any(x in task.lower()
+                                          for x in ["coolest", "lowest", "least", "minimum", "safest"]))
+    metric_col = "mean_surface_temp_c" if mode == "lst" else "mean_ndvi"
+    is_lst = "True" if mode == "lst" else "False"
+    try:
+        import geopandas as _gpd
+        utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
+    except Exception:
+        utm_epsg = 'EPSG:32643'
+    code = f"""
+import geopandas as gpd, pandas as pd, numpy as np
+from shapely.validation import make_valid
+from shapely.geometry import box
+import rasterio
+from rasterio.warp import transform_bounds
+import warnings; warnings.filterwarnings('ignore')
+
+def run_analysis():
+    global result
+    WGS84 = 'EPSG:4326'
+    UTM = '{utm_epsg}'
+    IS_LST = {is_lst}
+    metric_col = '{metric_col}'
+
+    wards = gpd.read_file('{b_path}')
+    wards['geometry'] = wards['geometry'].apply(make_valid)
+    if wards.crs is None: wards = wards.set_crs(WGS84)
+    else: wards = wards.to_crs(WGS84)
+
+    name_col = next((c for c in wards.columns if c.lower() in [
+                    'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en']), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(lambda x: x[0] if isinstance(
+        x, list) else x).fillna('Unknown').astype(str).str.strip()
+
+    # Filter oversized boundaries
+    wards_utm_check = wards.to_crs(UTM)
+    area_km2 = wards_utm_check.geometry.area / 1e6
+    area_median = area_km2.median()
+    wards = wards[area_km2.values <= area_median * \
+        8].copy().reset_index(drop=True)
+    city_lower = '{city}'.lower().strip()
+    wards = wards[wards['ward_name'].str.lower().str.strip() !=
+                                               city_lower].copy().reset_index(drop=True)
+    print(f'After filtering: {{len(wards)}} wards')
+
+    # Get raster bounds in WGS84 to clip wards
+    with rasterio.open('{tif_path}') as src:
+        raster_crs = src.crs
+        raster_bounds_native = src.bounds
+        raster_bounds_4326 = transform_bounds(raster_crs, 'EPSG:4326',
+            raster_bounds_native.left, raster_bounds_native.bottom,
+            raster_bounds_native.right, raster_bounds_native.top)
+        print(
+            f'Raster CRS: {{raster_crs}}, bounds(WGS84): {{[round(x,2) for x in raster_bounds_4326]}}')
+
+    # Only keep wards that overlap the raster footprint
+    raster_poly = box(*raster_bounds_4326)
+    wards['_overlaps'] = wards.geometry.intersects(raster_poly)
+    overlap_count = wards['_overlaps'].sum()
+    print(f'Wards overlapping raster: {{overlap_count}}/{{len(wards)}}')
+    wards = wards[wards['_overlaps']].copy().reset_index(drop=True)
+    wards = wards.drop(columns=['_overlaps'])
+
+    if len(wards) == 0:
+        raise ValueError('No wards overlap the satellite raster')
+
+    # Compute zonal stats for ALL wards in one call (opens raster once)
+    from rasterstats import zonal_stats
+    wards_in_raster_crs = wards.to_crs(raster_crs)
+    try:
+        stats = zonal_stats(wards_in_raster_crs, '{tif_path}', stats=['mean'], nodata=0, all_touched=True)
+        values = [s['mean'] if s and s['mean'] is not None else None for s in stats]
+    except Exception as _zs_e:
+        print(f'Vectorized zonal_stats failed ({{_zs_e}}), falling back to per-ward')
+        values = []
+        for idx, row in wards_in_raster_crs.iterrows():
+            try:
+                s = zonal_stats([row.geometry], '{tif_path}', stats=['mean'], nodata=0, all_touched=True)
+                val = s[0]['mean'] if s and s[0] and s[0]['mean'] is not None else None
+            except Exception:
+                val = None
+            values.append(val)
+
+    if IS_LST:
+        converted = [(v * 0.00341802 + 149.0 - 273.15) if v is not None and v > 0 else None for v in values]
+    else:
+        converted = values
+
+    wards[metric_col] = converted
+    wards = wards[wards[metric_col].notna()].copy().reset_index(drop=True)
+    wards[metric_col] = wards[metric_col].astype(float).round(2)
+
+    if len(wards) == 0:
+        raise ValueError('No wards have valid satellite pixels')
+
+    print(
+        f'Valid wards: {{len(wards)}}, range: {{wards[metric_col].min()}} to {{wards[metric_col].max()}}')
+
+    wards_utm = wards.to_crs(UTM).copy()
+    wards_utm['area_km2'] = (wards_utm.geometry.area / 1e6).round(3)
+    wards_utm['ward_name'] = wards['ward_name'].values
+    wards_utm[metric_col] = wards[metric_col].values
+
+    ascending = {ascending}
+    wards_utm = wards_utm.drop_duplicates(subset='ward_name', keep='first')
+    wards_utm = wards_utm.sort_values(
+        metric_col, ascending=ascending).reset_index(drop=True)
+    wards_utm['rank'] = range(1, len(wards_utm) + 1)
+
+    keep = ['rank', 'ward_name', metric_col, 'area_km2', 'geometry']
+    result = wards_utm[[c for c in keep if c in wards_utm.columns]].to_crs(
+        WGS84).reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(
+        0.0001, preserve_topology=True)
+    print(
+        f'Satellite: {{len(result)}} wards, {{metric_col}} range: {{result[metric_col].min()}} to {{result[metric_col].max()}}')
+
+run_analysis()
+"""
+    sandbox_result = run_code_in_sandbox(code, timeout=300)
+    if sandbox_result["success"]:
+        validation = validate_analysis_output(sandbox_result["output"], task)
+        if validation["valid"]:
+            print(f"[Analysis] Satellite {mode.upper()} succeeded")
+            return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
+        error = validation["error"]
+    else:
+        error = sandbox_result["error"]
+    return {"success": False, "error": error}
+
+
+# ── ESA WorldCover land cover analysis ───────────────────────────────────────
+
+def run_worldcover_analysis(task: str, plan: dict, retrieved_data: dict, tif_path: str) -> dict:
+    """
+    Computes per-ward land cover breakdown using ESA WorldCover 2022.
+    WorldCover class codes:
+      10=Trees, 20=Shrubland, 30=Grassland, 40=Cropland,
+      50=Built-up, 60=Bare/sparse, 70=Snow/ice, 80=Water,
+      90=Wetland, 95=Mangroves, 100=Moss/lichen
+    """
+    b_path = retrieved_data.get("osm_boundaries", {}).get("file_path")
+    _up_geo = _uploaded_boundary(plan)
+    if _up_geo:
+        b_path = _up_geo
+    elif "mumbai" in plan.get("city", "").lower():
+        b_path = "/data/mumbai_ward_shapefile/Mumbai_wards.geojson"
+    if not b_path or not os.path.exists(str(b_path)):
+        return {"success": False, "error": "Missing boundary file for WorldCover analysis"}
+
+    # Determine target class from task
+    task_lower = task.lower()
+    if any(x in task_lower for x in ["tree", "forest", "green cover", "vegetation"]):
+        target_class, class_name = 10, "tree_cover_pct"
+    elif any(x in task_lower for x in ["built", "urban", "impervious"]):
+        target_class, class_name = 50, "builtup_pct"
+    elif any(x in task_lower for x in ["water", "river", "lake"]):
+        target_class, class_name = 80, "water_pct"
+    elif any(x in task_lower for x in ["crop", "farm", "agricultural"]):
+        target_class, class_name = 40, "cropland_pct"
+    else:
+        target_class, class_name = None, "green_pct"  # all vegetated
+
+    city = _sq(plan.get("city", ""))
+    ascending = _hint_ascending(plan, any(x in task_lower for x in
+                                          ["least", "lowest", "fewest", "worst", "minimum", "least green", "most built"]))
+    try:
+        import geopandas as _gpd
+        utm_epsg = _get_utm_epsg(_gpd.read_file(b_path))
+    except Exception:
+        utm_epsg = 'EPSG:32643'
+
+    # Build class filter expression
+    if target_class:
+        class_filter = f"pixel_class == {target_class}"
+        class_label = class_name
+    else:
+        # All vegetated classes: trees(10) + shrubland(20) + grassland(30) + cropland(40)
+        class_filter = "pixel_class.isin([10, 20, 30, 40])"
+        class_label = "green_pct"
+
+    code = f"""
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import rasterio
+from rasterio.mask import mask as rio_mask
+from shapely.validation import make_valid
+import warnings; warnings.filterwarnings('ignore')
+
+def run_analysis():
+    global result
+    WGS84 = 'EPSG:4326'
+    UTM   = '{utm_epsg}'
+
+    wards = gpd.read_file('{b_path}')
+    wards['geometry'] = wards['geometry'].apply(make_valid)
+    if wards.crs is None: wards = wards.set_crs(WGS84)
+    else: wards = wards.to_crs(WGS84)
+
+    name_col = next((c for c in wards.columns if c.lower() in [
+        'ward_full','ward_name','name','ward','label','title','area_name','localname','name:en'
+    ]), wards.columns[0])
+    wards['ward_name'] = wards[name_col].apply(
+        lambda x: x[0] if isinstance(x, list) else x
+    ).fillna('Unknown').astype(str).str.strip()
+
+    # Filter oversized boundaries
+    wards_utm = wards.to_crs(UTM)
+    area_km2 = wards_utm.geometry.area / 1e6
+    area_median = area_km2.median()
+    wards = wards[area_km2.values <= area_median * 8].copy().reset_index(drop=True)
+    city_lower = '{city}'.lower().strip()
+    wards = wards[wards['ward_name'].str.lower().str.strip() != city_lower].copy().reset_index(drop=True)
+    print(f'After filtering: {{len(wards)}} wards')
+
+    tif_path = '{tif_path}'
+    rows = []
+    with rasterio.open(tif_path) as src:
+        for _, ward in wards.iterrows():
+            geom = [ward.geometry.__geo_interface__]
+            try:
+                clipped, _ = rio_mask(src, geom, crop=True, nodata=0)
+                pixels = clipped.flatten()
+                pixels = pixels[pixels != 0]
+                total = len(pixels)
+                if total == 0:
+                    pct = 0.0
+                else:
+                    if {target_class is not None}:
+                        target_pixels = pixels[pixels == {target_class if target_class else 0}]
+                    else:
+                        target_pixels = pixels[np.isin(pixels, [10,20,30,40])]
+                    pct = round(100.0 * len(target_pixels) / total, 2)
+            except Exception:
+                pct = 0.0
+            rows.append({{'ward_name': ward['ward_name'], '{class_label}': pct}})
+
+    df = pd.DataFrame(rows)
+    wards_out = wards.merge(df, on='ward_name', how='left')
+    wards_out['{class_label}'] = wards_out['{class_label}'].fillna(0.0)
+    wards_out = wards_out.to_crs(UTM)
+    wards_out['area_km2'] = (wards_out.geometry.area / 1e6).round(3)
+    wards_out = wards_out.to_crs(WGS84)
+    wards_out = wards_out.sort_values('{class_label}', ascending={ascending}).reset_index(drop=True)
+    wards_out['rank'] = range(1, len(wards_out) + 1)
+    keep = ['rank','ward_name','{class_label}','area_km2','geometry']
+    result = wards_out[[c for c in keep if c in wards_out.columns]].reset_index(drop=True)
+    result['geometry'] = result.geometry.simplify(0.0001, preserve_topology=True)
+
+run_analysis()
+"""
+    print(
+        f"[Analysis] Running WorldCover land cover for {city} (UTM: {utm_epsg})...")
+    sandbox_result = run_code_in_sandbox(code)
+    if sandbox_result["success"]:
+        validation = validate_analysis_output(sandbox_result["output"], task)
+        if validation["valid"]:
+            print("[Analysis] WorldCover analysis succeeded")
+            return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
+        error = validation["error"]
+    else:
+        error = sandbox_result["error"]
+    return {"success": False, "error": error}
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
+
 
 def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
     print(f"[Analysis] Starting: {task}")
-    # GISclaw Feature 1: clear sandbox cache for each new task
-    clear_sandbox_cache()
     domain_hint = plan.get("domain_hint", "") or ""
     hint_config = _parse_domain_hint(domain_hint)
     if hint_config:
@@ -2395,16 +3232,23 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             return all(os.path.exists(p) for p in paths) if paths else True
         # Skip memory reuse if generic engine handles this query type
         from agents.generic_engine import parse_query as _pq
-        _generic_handles = _pq(task)[0] is not None or _pq(task)[5] is not None
+        _pq_res = _pq(task)
+        _generic_handles = _pq_res[0] is not None or _pq_res[5] is not None
 
-        if (not _generic_handles and similar and stored_code and similar[0].get("similarity", 0) > 0.95 and
+        _is_satellite_q = any(x in task.lower() for x in [
+            "heat island", "urban heat", "uhi", "thermal", "surface temperature",
+            "lst", "ndvi", "vegetation index", "vegetation health", "greenness",
+            "heat map", "heat stress", "vegetation cover", "leaf area"])
+        if (not _generic_handles and not _is_satellite_q and similar and stored_code and
+                similar[0].get("similarity", 0) > 0.95 and
                 stored_city == current_city and current_city in stored_code.lower() and
                 _code_paths_valid(stored_code)):
             print(
                 f"[Analysis] Reusing code from memory (similarity: {similar[0]['similarity']})")
             sandbox_result = run_code_in_sandbox(stored_code)
             if sandbox_result["success"]:
-                validation = validate_analysis_output(sandbox_result["output"])
+                validation = validate_analysis_output(
+                    sandbox_result["output"], task)
                 if validation["valid"]:
                     print("[Analysis] Reused code succeeded")
                     return {"success": True, "code": stored_code, "output": sandbox_result["output"], "attempts": 1}
@@ -2418,15 +3262,39 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
     is_vulnerability = any(x in task_lower_q for x in [
         "vulnerability", "vulnerable", "combining", "composite", "combined score", "risk score", "multi-factor"])
     is_flood = any(x in task_lower_q for x in [
-                   "flood", "inundation", "water risk", "flood risk"]) and not is_per_capita
+        "flood", "inundation", "water risk", "flood risk"]) and not is_per_capita
     print(
         f"[Analysis] Query type: per_capita={is_per_capita}, flood={is_flood}, vulnerability={is_vulnerability}")
+    is_uhi = any(x in task_lower_q for x in [
+        "heat island", "urban heat", "uhi", "surface temperature",
+        "land surface temperature", "lst", "thermal", "hot spot", "hotspot",
+        "heat map", "heat stress"])
+    is_ndvi = any(x in task_lower_q for x in [
+        "ndvi", "vegetation index", "vegetation health", "greenness",
+        "vegetation cover", "leaf area"])
+    is_worldcover = any(x in task_lower_q for x in [
+        "land cover", "landcover", "land use", "lulc", "green cover",
+        "built-up", "built up", "urban area percentage", "vegetation percentage",
+        "tree cover", "bare soil", "impervious surface", "esa worldcover", "worldcover"])
 
-    if is_mumbai_flood_query(task, plan) and not is_per_capita and not is_vulnerability:
+    # Composite + feature checks — computed ONCE, used by all deterministic gates
+    try:
+        from agents.generic_engine import parse_query as _pq_once
+        _pq_res_once = _pq_once(task)
+        _is_composite = bool(_pq_res_once[5])
+        _is_generic_feature = _pq_res_once[0] is not None
+    except Exception:
+        _is_composite = False
+        _is_generic_feature = False
+
+    _hint_has_buffer = any(k.startswith("buffer")
+                           for k in plan.get("_hint_config", {}))
+    if is_mumbai_flood_query(task, plan) and not is_per_capita and not is_vulnerability and not _hint_has_buffer:
         print("[Analysis] Mumbai flood benchmark path")
         sandbox_result = run_code_in_sandbox(MUMBAI_FLOOD_CODE)
         if sandbox_result["success"]:
-            validation = validate_analysis_output(sandbox_result["output"])
+            validation = validate_analysis_output(
+                sandbox_result["output"], task)
             if validation["valid"]:
                 print("[Analysis] Mumbai flood benchmark succeeded")
                 return {"success": True, "code": MUMBAI_FLOOD_CODE, "output": sandbox_result["output"], "attempts": 1}
@@ -2435,12 +3303,21 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
     has_geojson = any(f["type"] == "geojson" for f in upload_files)
     has_csv = any(f["type"] == "csv" for f in upload_files)
 
+    geojson_count = sum(1 for f in upload_files if f["type"] == "geojson")
+    if geojson_count >= 2 and not (is_uhi or is_ndvi):
+        print(f"[Analysis] Multi-GeoJSON path ({geojson_count} files)")
+        result = run_multi_geojson_analysis(task, plan)
+        if result["success"]:
+            return result
+        print(
+            f"[Analysis] Multi-GeoJSON path failed: {result.get('error', '')[:100]}")
+
     if has_geojson and has_csv:
         print("[Analysis] Multi-file path (GeoJSON + CSV)")
         result = run_multi_file_analysis(task, plan)
         if result["success"]:
             geo_check = validate_geographic_result(
-                result.get("code", ""), plan.get("city", ""))
+                result.get("output", ""), plan.get("city", ""))
             if geo_check["valid"]:
                 return result
             print(f"[Analysis] {geo_check['error']}")
@@ -2448,10 +3325,10 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             print(
                 f"[Analysis] Multi-file path failed: {result.get('error', '')[:100]}")
 
-    if plan.get("upload_path"):
+    if plan.get("upload_path") and not (is_uhi or is_ndvi):
         task_lower = task.lower()
         needs_osm_points = any(x in task_lower for x in [
-                               "hospital", "clinic", "medical", "school", "education"])
+            "hospital", "clinic", "medical", "school", "education"])
         if needs_osm_points:
             print("[Analysis] Hybrid Upload+OSM path")
             result = run_hybrid_upload_osm_analysis(task, plan)
@@ -2466,7 +3343,8 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             f"[Analysis] Single file path failed: {result.get('error', '')[:100]}")
 
     has_boundaries = ("osm_boundaries" in retrieved_data and retrieved_data["osm_boundaries"].get("file_path") and os.path.exists(
-        str(retrieved_data["osm_boundaries"].get("file_path", "")))) or "mumbai" in plan.get("city", "").lower()
+        str(retrieved_data["osm_boundaries"].get("file_path", "")))) or "mumbai" in plan.get("city", "").lower() \
+        or bool(_uploaded_boundary(plan))
     if is_per_capita and has_boundaries:
         print("[Analysis] Per-capita analysis path")
         result = run_per_capita_analysis(task, plan, retrieved_data)
@@ -2474,7 +3352,89 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             return result
         print(f"[Analysis] Per-capita failed: {result.get('error', '')[:100]}")
 
-    # Mumbai general engine — ONLY fires for pure population/area/density queries
+    # ── Satellite UHI / NDVI path ─────────────────────────────────────────
+    if (is_uhi or is_ndvi) and has_boundaries:
+        sat_key = "satellite_thermal" if is_uhi else "satellite_ndvi"
+        sat_data = retrieved_data.get(sat_key, {})
+        sat_output = sat_data.get("output", "")
+        # Try regex first
+        import re as _re_sat
+        tif_match = _re_sat.search(r"tif_path=([^\s]+)", sat_output)
+        # Fallback: construct path from city name
+        if not tif_match:
+            city_slug = plan.get("city", "").split(
+                ",")[0].strip().replace(" ", "_")
+            prefix = "lst" if is_uhi else "ndvi"
+            fallback_path = f"/data/processed/{prefix}_{city_slug}.tif"
+            if os.path.exists(fallback_path):
+                tif_path = fallback_path
+                print(
+                    f"[Analysis] Satellite tif_path from fallback: {tif_path}")
+            else:
+                tif_path = None
+        else:
+            tif_path = tif_match.group(1)
+        if tif_path and os.path.exists(tif_path):
+            print(f"[Analysis] Satellite {'UHI' if is_uhi else 'NDVI'} path")
+            if not retrieved_data.get("osm_boundaries", {}).get("file_path"):
+                print("[Analysis] Satellite: boundaries missing — fetching inline")
+                try:
+                    from agents.retrieval_agent import generate_osmnx_fetch_code as _gfc
+                    from agents.retrieval_agent import run_code_in_sandbox as _rcs
+                    import hashlib as _hl
+                    _bh = int(_hl.md5(
+                        plan.get("city", "").encode()).hexdigest()[:8], 16) % 1_000_000
+                    _bp = f"/data/processed/osm_boundaries_{_bh}.geojson"
+                    if not os.path.exists(_bp):
+                        _bc = _gfc("osm_boundaries",
+                                   plan.get("city", ""), task)
+                        _br = _rcs(_bc, timeout=600, save_path=_bp)
+                        if not (_br["success"] and os.path.exists(_bp)):
+                            _bp = None
+                    if _bp and os.path.exists(_bp):
+                        retrieved_data["osm_boundaries"] = {
+                            "file_path": _bp, "output": "inline", "attempts": 1}
+                        print(
+                            f"[Analysis] Satellite: inline boundaries at {_bp}")
+                except Exception as _be:
+                    print(
+                        f"[Analysis] Satellite: inline boundary fetch failed: {_be}")
+            result = run_uhi_analysis(
+                task, plan, retrieved_data, tif_path, "lst" if is_uhi else "ndvi")
+            if result["success"]:
+                plan["_analysis_path"] = "satellite_uhi" if is_uhi else "satellite_ndvi"
+                return result
+            print(
+                f"[Analysis] Satellite path failed: ...{result.get('error', '')[-300:]}")
+        else:
+            print(
+                f"[Analysis] Satellite tif not found for {plan.get('city', '')}")
+
+    # ── ESA WorldCover land cover path ────────────────────────────────────────
+    if is_worldcover and has_boundaries:
+        wc_data = retrieved_data.get("satellite_worldcover", {})
+        wc_output = wc_data.get("output", "")
+        import re as _re_wc
+        tif_match_wc = _re_wc.search(r"tif_path=([^\s]+)", wc_output)
+        if not tif_match_wc:
+            city_slug_wc = plan.get("city", "").split(
+                ",")[0].strip().replace(" ", "_")
+            fallback_wc = f"/data/processed/worldcover_{city_slug_wc}.tif"
+            tif_path_wc = fallback_wc if os.path.exists(fallback_wc) else None
+        else:
+            tif_path_wc = tif_match_wc.group(1)
+        if tif_path_wc and os.path.exists(tif_path_wc):
+            print(f"[Analysis] ESA WorldCover land cover path")
+            result = run_worldcover_analysis(
+                task, plan, retrieved_data, tif_path_wc)
+            if result["success"]:
+                plan["_analysis_path"] = "satellite_worldcover"
+                return result
+            print(
+                f"[Analysis] WorldCover path failed: {result.get('error', '')[:100]}")
+        else:
+            print(
+                f"[Analysis] WorldCover tif not found for {plan.get('city', '')}")
     # Block it for any query that involves specific OSM features
     _OSM_FEATURE_KEYWORDS = [
         'hospital', 'clinic', 'school', 'university', 'college',
@@ -2487,9 +3447,8 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
     has_deterministic = any(k in retrieved_data for k in [
         'osm_hospitals', 'osm_roads', 'osm_water', 'osm_schools',
         'osm_greenspace', 'osm_transit', 'osm_commercial', 'osm_cycling', 'osm_parking'])
-    if "mumbai" in plan.get("city", "").lower() and not is_per_capita and not has_deterministic and not _is_osm_feature_query:
-        from agents.generic_engine import parse_query as _pq_check
-        if _pq_check(task)[5]:
+    if "mumbai" in plan.get("city", "").lower() and not upload_files and not is_per_capita and not has_deterministic and not _is_osm_feature_query and not _is_generic_feature and not SKIP_DETERMINISTIC:
+        if _is_composite:
             print(
                 "[Analysis] Composite pattern detected — skipping Mumbai general engine")
         else:
@@ -2499,10 +3458,13 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
                 return result
         print("[Analysis] Mumbai general engine failed — falling back to Groq")
 
-    # Hospital density — works with just osm_hospitals (boundaries optional)
-    if "osm_hospitals" in retrieved_data and not is_per_capita:
-        from agents.generic_engine import parse_query as _pq_check
-        if _pq_check(task)[5]:
+    # Hospital density — works with just osm_hospitals (boundaries optional).
+    # Also fires when the query is about hospitals but retrieval failed to
+    # produce osm_hospitals, so the inline fetch fallback can recover it.
+    _wants_hospital = any(x in task_lower_q for x in [
+                          "hospital", "clinic", "doctor", "medical", "healthcare"])
+    if ("osm_hospitals" in retrieved_data or _wants_hospital) and not is_per_capita and not SKIP_DETERMINISTIC:
+        if _is_composite:
             print(
                 "[Analysis] Composite pattern detected — skipping deterministic hospital")
         else:
@@ -2513,9 +3475,8 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             print(
                 f"[Analysis] Hospital density failed: {result.get('error', '')[:100]}")
 
-    if "osm_boundaries" in retrieved_data and "osm_roads" in retrieved_data and not is_per_capita:
-        from agents.generic_engine import parse_query as _pq_check
-        if _pq_check(task)[5]:
+    if "osm_boundaries" in retrieved_data and "osm_roads" in retrieved_data and not is_per_capita and not SKIP_DETERMINISTIC:
+        if _is_composite:
             print("[Analysis] Composite pattern detected — skipping deterministic road")
         else:
             print("[Analysis] Deterministic road density path")
@@ -2525,9 +3486,8 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             print(
                 f"[Analysis] Road density failed: {result.get('error', '')[:100]}")
 
-    if "osm_boundaries" in retrieved_data and "osm_water" in retrieved_data and not is_per_capita:
-        from agents.generic_engine import parse_query as _pq_check
-        if _pq_check(task)[5]:
+    if "osm_boundaries" in retrieved_data and "osm_water" in retrieved_data and not is_per_capita and not SKIP_DETERMINISTIC:
+        if _is_composite:
             print(
                 "[Analysis] Composite pattern detected — skipping deterministic flood")
         else:
@@ -2539,9 +3499,8 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             print(
                 f"[Analysis] Flood risk failed: {result.get('error', '')[:100]}")
 
-    if "osm_boundaries" in retrieved_data and "osm_schools" in retrieved_data and not is_per_capita:
-        from agents.generic_engine import parse_query as _pq_check
-        if _pq_check(task)[5]:
+    if "osm_boundaries" in retrieved_data and "osm_schools" in retrieved_data and not is_per_capita and not SKIP_DETERMINISTIC:
+        if _is_composite:
             print(
                 "[Analysis] Composite pattern detected — skipping deterministic schools")
         else:
@@ -2552,9 +3511,12 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             print(
                 f"[Analysis] Schools failed: {result.get('error', '')[:100]}")
 
-    if "osm_greenspace" in retrieved_data and not is_per_capita:
-        from agents.generic_engine import parse_query as _pq_check
-        if _pq_check(task)[5]:
+    if "osm_parks" in retrieved_data and "osm_greenspace" not in retrieved_data and not is_per_capita and not SKIP_DETERMINISTIC:
+        retrieved_data["osm_greenspace"] = retrieved_data["osm_parks"]
+        print("[Analysis] osm_parks aliased to greenspace deterministic path")
+
+    if "osm_greenspace" in retrieved_data and not is_per_capita and not SKIP_DETERMINISTIC:
+        if _is_composite:
             print(
                 "[Analysis] Composite pattern detected — skipping deterministic greenspace")
         else:
@@ -2571,7 +3533,7 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
     # Skipped when specific deterministic sources are already present so
     # hospital/road/water/schools/greenspace paths run unchanged.
     _has_specific_sources = any(k in retrieved_data for k in [
-        "osm_hospitals", "osm_roads", "osm_water", "osm_schools", "osm_greenspace"])
+        "osm_hospitals", "osm_roads", "osm_water", "osm_schools", "osm_greenspace", "osm_parks"])
     if not _has_specific_sources:
         try:
             from agents.generic_engine import run_generic_analysis as _run_generic_early
@@ -2617,10 +3579,11 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
         code = generate_osmnx_analysis_code(task, plan)
         sandbox_result = run_code_in_sandbox(code)
         if sandbox_result["success"]:
-            validation = validate_analysis_output(sandbox_result["output"])
+            validation = validate_analysis_output(
+                sandbox_result["output"], task)
             if validation["valid"]:
                 geo_check = validate_geographic_result(
-                    code, plan.get("city", ""))
+                    sandbox_result["output"], plan.get("city", ""))
                 if geo_check["valid"]:
                     print("[Analysis] OSMnx template succeeded")
                     return {"success": True, "code": code, "output": sandbox_result["output"], "attempts": 1}
@@ -2662,7 +3625,6 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
         if attempt == 0:
             code = generate_analysis_code(
                 task, data_schema, plan, retrieved_data)
-            code = patch_result_assignment(code)
         else:
             history_text = "\n\n".join(
                 f"Attempt {h['attempt']}:\n{h['code'][:400]}...\nError: {h['error'][:300]}"
@@ -2691,9 +3653,8 @@ def run_analysis_for_task(task: str, retrieved_data: dict, plan: dict) -> dict:
             past_fixes = retrieve_similar_fix(last_error)
             memory_hint = ""
             if past_fixes:
-                memory_hint = "\nPast fixes:\n" + \
-                    "".join(
-                        f"- Error: {pf['error_snippet'][:100]}\n  Fix: {pf['fix_code'][:200]}\n" for pf in past_fixes)
+                memory_hint = "\nPast fixes:\n" + "".join(
+                    f"- Error: {pf['error_snippet'][:100]}\n  Fix: {pf['fix_code'][:200]}\n" for pf in past_fixes)
                 print(
                     f"[ErrorMemory] Injecting {len(past_fixes)} past fix(es)")
             gtchain_section = ""
@@ -2731,12 +3692,13 @@ Return only Python code."""
             if code.startswith("python\n") or code.startswith("python "):
                 code = code[6:].strip()
 
+        code = patch_result_assignment(code)
         code_hash = hash(code.strip())
         if code_hash in submitted_codes:
             # GISclaw context-aware deduplication (Section 4.3.2):
             # Allow retry if error changed — same code may succeed after timeout
             last_same = next((h for h in reversed(attempt_history)
-                             if hash(h.get('code', '').strip()) == code_hash), None)
+                              if hash(h.get('code', '').strip()) == code_hash), None)
             if last_same and last_same.get('error', '')[:50] == error[:50]:
                 print(
                     f"[Analysis] Attempt {attempt+1}/5 — duplicate code+error, skipping")
@@ -2765,10 +3727,12 @@ Return only Python code."""
         print(f"[Analysis] Attempt {attempt+1}/5")
         sandbox_result = run_code_in_sandbox(code)
         if sandbox_result["success"]:
-            validation = validate_analysis_output(sandbox_result["output"])
+            validation = validate_analysis_output(
+                sandbox_result["output"], task)
             if validation["valid"]:
                 city = plan.get("city", "")
-                geo_check = validate_geographic_result(code, city)
+                geo_check = validate_geographic_result(
+                    sandbox_result["output"], city)
                 if not geo_check["valid"]:
                     print(f"[Analysis] {geo_check['error']}")
                     error = geo_check["error"]
@@ -2805,7 +3769,14 @@ def generate_methodology_explanation(task: str, plan: dict, result: dict) -> str
     code = result.get("code", "")
     city = plan.get("city", "")
     data_sources = []
-    if "worldpop" in code.lower() or "rasterstats" in code.lower():
+    _path = plan.get("_analysis_path", "")
+    if _path == "satellite_uhi" or "lst_" in code:
+        data_sources.append(
+            "Landsat 8/9 thermal imagery (land surface temperature, Microsoft Planetary Computer)")
+    elif _path == "satellite_ndvi" or "ndvi_" in code:
+        data_sources.append(
+            "Landsat 8/9 imagery (NDVI, Microsoft Planetary Computer)")
+    if "worldpop" in code.lower():
         data_sources.append("WorldPop 2020 population raster")
     if "osm" in code.lower() or "ox." in code:
         data_sources.append("OpenStreetMap")
@@ -2836,8 +3807,12 @@ def _extract_path(code: str) -> str:
 # ── Feature #7: Startup WorldPop pre-download ────────────────────────────────
 
 # Countries to pre-download on worker startup — covers most common query cities
-STARTUP_WORLDPOP_COUNTRIES = ["IND", "GBR", "DEU",
-                              "FRA", "NLD", "USA", "BRA", "NGA", "KEN", "AUS"]
+# Includes all live-test suite countries: Berlin/London/Mumbai/Cairo/Seoul/
+# New Delhi/Paris/Bengaluru + other frequent CITY_ISO3 entries
+STARTUP_WORLDPOP_COUNTRIES = ["IND", "GBR", "DEU", "FRA", "NLD",
+                              "USA", "BRA", "NGA", "KEN", "AUS",
+                              "KOR", "JPN", "EGY", "ESP", "ITA",
+                              "SGP", "ARE", "TUR", "ZAF", "CAN"]
 
 
 def predownload_worldpop() -> None:
