@@ -107,6 +107,19 @@ Then type a question (e.g. `flood per ward`) and a city (e.g. `Mumbai`) and clic
 
 ---
 
+## Cloud deployment (Azure)
+
+NLGeo is deployed on an **Azure Virtual Machine** (Standard B2s_v2, Central India region) running the full containerized stack via Docker Compose. The deployment covers:
+
+- Multi-container orchestration (API, worker, PostgreSQL/PostGIS, Redis, Qdrant, Grafana) on a single VM
+- Network security group rules exposing the API and dashboard ports
+- Persistent volume mounts for geospatial data and vector memory
+- SSH key–based access and a slimmed compose file (`docker-compose.azure.yml`) tuned for the VM's resource envelope
+
+The same `docker compose up` workflow that runs locally runs on the VM — the deployment is configuration, not a code fork.
+
+---
+
 ## Research foundation
 
 NLGeo extends five peer-reviewed autonomous-GIS systems — LLM-Geo (Li & Ning, 2023), LLM-Find (Ning et al., 2025), GIS Copilot (Akinboyewa et al., 2025), GISclaw (Han et al., 2025), and GTChain (Zhang et al., 2025) — adding persistent quality-gated memory, a deterministic-first execution model, production REST API, any-city support, interactive maps, and full LLM observability that none of the originals had. The comparison table and rationale are in [DESIGN.md](DESIGN.md).
