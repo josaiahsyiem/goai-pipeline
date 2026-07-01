@@ -4,7 +4,7 @@
 
 NLGeo turns a query like *"Which Mumbai wards have the highest flood-exposed population?"* or *"Pharmacies per ward in Berlin"* into a ranked ward-level map — no GIS expertise required. It fetches live OpenStreetMap data, runs deterministic or LLM-generated geospatial analysis in a sandbox, self-verifies the result, and renders an interactive Leaflet map.
 
-🎥 **[Demo video](https://youtu.be/h7c9p2f2qqk)** · *M.Tech thesis project, CSRE, IIT Bombay*
+🎥 **[Demo video](https://youtu.be/h7c9p2f2qqk)** 
 
 ---
 
